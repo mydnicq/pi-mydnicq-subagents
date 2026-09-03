@@ -1,3 +1,6 @@
 node_modules/
 *.log
 .DS_Store
+.pi/AGENTS.md
+.pi/settings.json
+.pi/npm/

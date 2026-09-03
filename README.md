@@ -2,12 +2,38 @@
 
 A [pi](https://pi.dev) extension for delegating tasks to subagents.
 
-> Early scaffold — under active development.
+Delegation spawns each subagent as an isolated `pi` child process
+(`--mode json -p --no-session`) with the agent's own model, thinking level, and
+system prompt; the parent receives the child's final text output. Nested
+delegation is disabled: child processes cannot run the `subagent` tool again.
+
+There are two ways to delegate:
+
+- **Manual** — `/subagent <name> <task>` in the prompt. The result is injected
+  into the conversation as a `[subagent-result]` message and the main agent gets
+  a turn to act on it. `/subagent` without arguments lists the configured
+  agents; agent names autocomplete after `/subagent `.
+- **Autonomous** — the main model calls the `subagent` tool with
+  `{ agent, task }`. The tool description carries the current agent roster
+  (refreshed on every session start), so the model can pick an agent on its own.
+
+## Run history (follow a run in the browser)
+
+Every run persists its child session under the shared run history root
+(`$TMPDIR/pi-mydnicq-history/<session-uuid>/<agent-runId>/`) and re-exports it
+to HTML (pi's /export pipeline) while the run is in flight. One shared
+loopback server serves all pi sessions by path (discovered via a global
+`server.json` registry; a failed probe makes the next session claim a fresh
+port), and the subagent run card shows a **↗ history** link to the run's page
+under the parent session's uuid — ctrl/cmd-click it (herdr opens pane links
+only for http/https). Pages are static; refresh the browser page to see the
+latest export. Terminals without OSC 8 show the plain URL/path instead
+(Ctrl+O to expand).
 
 ## Defining agents
 
 Each agent is a Markdown file with YAML frontmatter in the project's `.pi/agents` directory.
-The **file name defines the agent name**; the Markdown body is the agent's system prompt.
+The **frontmatter `name` field defines the agent name**; the Markdown body is the agent's system prompt.
 
 ```markdown
 <!-- .pi/agents/reviewer.md -->
@@ -29,13 +55,17 @@ You are a code reviewer. ...
   - `thinking` — `off|minimal|low|medium|high|xhigh|max`
   - `context` — how the child inherits parent context:
     - `fresh` — brand-new session; the child only sees the delegated task
-    - `fork` — branches from the parent conversation so the child sees it so far (falls back to `fresh` when there is no persisted parent session to branch from)
+    - `fork` — the child's prompt is prefixed with a serialized transcript of
+      the parent conversation (tool calls summarized, thinking dropped, tail
+      truncated at ~48k chars); the child still runs in a fresh ephemeral
+      session and no parent session files are touched
 - The Markdown body is the agent's system prompt.
-- The file name is organizational only — the `name` field defines the agent; naming the file after the agent is recommended.
-- There is no `name` field — the file name (without `.md`) defines the agent name; use lowercase letters, digits, `-` or `_`.
+- The frontmatter `name` field defines the agent name; the file name is
+  organizational only — naming the file after the agent is recommended.
 - Unknown frontmatter fields log a warning and are ignored.
 - Files without frontmatter (e.g. a stray README) are skipped.
-- Agents load from the nearest ancestor directory containing `.pi`; use `/subagents` in pi to list what was found.
+- Agents load from the nearest ancestor directory containing `.pi`;
+  `/subagents` lists what was found.
 
 ## Install
 
