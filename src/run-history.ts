@@ -4,9 +4,11 @@
  * Each run persists its child session under the shared run history root,
  * grouped by the parent session's uuid (<root>/<sessionUuid>/<runId>), and
  * re-exports that file to an HTML page as the run progresses, reusing pi's
- * built-in /export HTML pipeline. The page carries the agent's system prompt
- * (body plus the appended context-file section — see composeHistorySystemPrompt
- * in loader.ts) and its `tools` allowlist (resolved to builtin pi tool
+ * built-in /export HTML pipeline. The page carries the subagent's actual final
+ * system prompt — captured inside the child by child-prompt-probe.ts (session
+ * files never record it, and extensions may edit it in ways the parent cannot
+ * reconstruct; composeHistorySystemPrompt in loader.ts is only the fallback) —
+ * and its `tools` allowlist (resolved to builtin pi tool
  * definitions) so the browser view shows what the subagent could see and do. The subagent run
  * card links to the page (one
  * shared loopback server for all pi sessions serves it by path) so the
@@ -21,7 +23,8 @@ import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 import { SessionManager, createCodingTools, createPowerShellTool } from "@earendil-works/pi-coding-agent";
 import { getPiInvocation } from "./pi-invocation.ts";
-import { RUN_HISTORY_ROOT, runHistoryPageUrl } from "./run-history-server.ts";
+import { runHistoryPageUrl } from "./run-history-server.ts";
+import { ARTIFACTS_ROOT, SYSTEM_PROMPT_CAPTURE_FILE_NAME } from "./constants.ts";
 
 const execFileAsync = promisify(execFile);
 
@@ -150,7 +153,7 @@ function sanitizePathSegment(value: string): string {
  */
 export function createRunHistoryPaths(sessionUuid: string, agentName: string): RunHistoryPaths {
 	const runId = `${sanitizePathSegment(agentName)}-${randomBytes(4).toString("hex")}`;
-	const dir = path.join(RUN_HISTORY_ROOT, sanitizePathSegment(sessionUuid), runId);
+	const dir = path.join(ARTIFACTS_ROOT, sanitizePathSegment(sessionUuid), runId);
 	fs.mkdirSync(dir, { recursive: true });
 	return {
 		dir,
@@ -213,6 +216,18 @@ export class RunHistoryExporter {
 		});
 	}
 
+	/** The child's captured final system prompt, once the probe wrote it; undefined until then. */
+	private readCapturedSystemPrompt(): string | undefined {
+		try {
+			const captured = fs
+				.readFileSync(path.join(this.paths.dir, SYSTEM_PROMPT_CAPTURE_FILE_NAME), "utf8")
+				.trim();
+			return captured || undefined;
+		} catch {
+			return undefined;
+		}
+	}
+
 	/** Run one export now, after any in-flight export settles (final export at run end). */
 	async flushExport(): Promise<RunHistoryStatus> {
 		await this.inFlight;
@@ -221,7 +236,11 @@ export class RunHistoryExporter {
 
 	private async runExport(): Promise<RunHistoryStatus> {
 		try {
-			await exportRunHistoryToHtml(this.paths, this.systemPrompt, this.tools);
+			// Prefer the probe's capture of the child's actual final system prompt —
+			// extensions may edit it in ways the parent cannot reconstruct — and fall
+			// back to the composed reconstruction until the capture lands.
+			const systemPrompt = this.readCapturedSystemPrompt() ?? this.systemPrompt;
+			await exportRunHistoryToHtml(this.paths, systemPrompt, this.tools);
 			this.status = { htmlFile: this.paths.htmlFile, url: this.status.url };
 		} catch (error) {
 			this.status = {

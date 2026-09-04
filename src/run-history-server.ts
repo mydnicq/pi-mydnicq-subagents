@@ -17,11 +17,8 @@
 
 import * as fs from "node:fs";
 import * as http from "node:http";
-import * as os from "node:os";
 import * as path from "node:path";
-
-/** Shared root directory all pi sessions export run history into. */
-export const RUN_HISTORY_ROOT = path.join(os.tmpdir(), "pi-mydnicq-history");
+import { ARTIFACTS_ROOT } from "./constants.ts";
 
 /** Magic body of the /__history-ping probe; identifies our server on a port. */
 const RUN_HISTORY_SERVER_MAGIC = "pi-mydnicq-history-server v1";
@@ -45,7 +42,7 @@ function handleHistoryRequest(req: http.IncomingMessage, res: http.ServerRespons
 		return;
 	}
 	// Segments exclude "/" and "." (regex above), so the path stays inside the root.
-	const runDir = path.join(RUN_HISTORY_ROOT, match[1], match[2]);
+	const runDir = path.join(ARTIFACTS_ROOT, match[1], match[2]);
 	let html: string;
 	try {
 		html = fs.readFileSync(path.join(runDir, "history.html"), "utf8");
@@ -74,7 +71,7 @@ interface ServerRegistry {
 }
 
 function registryFilePath(): string {
-	return path.join(RUN_HISTORY_ROOT, REGISTRY_FILE_NAME);
+	return path.join(ARTIFACTS_ROOT, REGISTRY_FILE_NAME);
 }
 
 /** Read the global registry; undefined when absent or malformed. */
@@ -90,7 +87,7 @@ function readServerRegistry(): ServerRegistry | undefined {
 
 /** Atomically publish this process as the registry's server holder. */
 function writeServerRegistry(port: number): void {
-	fs.mkdirSync(RUN_HISTORY_ROOT, { recursive: true });
+	fs.mkdirSync(ARTIFACTS_ROOT, { recursive: true });
 	const tmp = `${registryFilePath()}.tmp-${process.pid}`;
 	fs.writeFileSync(tmp, JSON.stringify({ port, pid: process.pid, startedAt: Date.now() } satisfies ServerRegistry));
 	fs.renameSync(tmp, registryFilePath());

@@ -5,7 +5,7 @@
  *
  *   pi --mode json -p --session <run-history-session-file> --model <model> \
  *      --thinking <level> --tools <allowlist> [--no-context-files]
- *      [--append-system-prompt <file>] "<prompt>"
+ *      [--extension <child-prompt-probe>] [--append-system-prompt <file>] "<prompt>"
  *
  * The child persists its session to a private run-history temp file so the
  * transcript can be exported to HTML and followed in a browser while the run
@@ -27,7 +27,6 @@
 
 import { spawn } from "node:child_process";
 import * as fs from "node:fs";
-import * as os from "node:os";
 import * as path from "node:path";
 import type {
 	AgentToolUpdateCallback,
@@ -39,6 +38,8 @@ import type {
 import type { AgentDefinition } from "./loader.ts";
 import { composeHistorySystemPrompt } from "./loader.ts";
 import { getPiInvocation } from "./pi-invocation.ts";
+import { CAPTURE_SYSTEM_PROMPT_ENV } from "./child-prompt-probe.ts";
+import { ARTIFACTS_ROOT, CHILD_PROMPT_PROBE_PATH, SYSTEM_PROMPT_CAPTURE_FILE_NAME } from "./constants.ts";
 import {
 	RunHistoryExporter,
 	createRunHistoryPaths,
@@ -185,9 +186,11 @@ export function listActiveSubagentRuns(): StoppableSubagentRun[] {
 	return [...activeSubagentRuns.values()];
 }
 
-/** Write the agent's system prompt to a 0600 temp file for --append-system-prompt. */
+/** Write the agent's system prompt to a 0600 temp file under the artifacts root for --append-system-prompt. */
 async function writeSystemPromptFile(agentName: string, systemPrompt: string): Promise<{ dir: string; file: string }> {
-	const dir = await fs.promises.mkdtemp(path.join(os.tmpdir(), "pi-mydnicq-subagent-"));
+	const tmpRoot = path.join(ARTIFACTS_ROOT, "tmp");
+	await fs.promises.mkdir(tmpRoot, { recursive: true });
+	const dir = await fs.promises.mkdtemp(path.join(tmpRoot, "prompt-"));
 	const safeName = agentName.replace(/[^\w.-]+/g, "_");
 	const file = path.join(dir, `system-prompt-${safeName}.md`);
 	await fs.promises.writeFile(file, systemPrompt, { encoding: "utf8", mode: 0o600 });
@@ -307,6 +310,11 @@ export async function runSubagent(options: SubagentRunOptions): Promise<Subagent
 		agent.tools.join(","),
 	];
 
+	// Child-side probe extension: captures the child's final chained system
+	// prompt (session files don't record it, and extensions may edit it) so the
+	// run-history page can show what the subagent actually saw.
+	args.push("--extension", CHILD_PROMPT_PROBE_PATH);
+
 	// Context files (AGENTS.md/CLAUDE.md): the child pi process discovers and
 	// appends them itself unless the agent opted out with projectContext: false.
 	if (!agent.projectContext) {
@@ -343,7 +351,11 @@ export async function runSubagent(options: SubagentRunOptions): Promise<Subagent
 				cwd,
 				shell: false,
 				stdio: ["ignore", "pipe", "pipe"],
-				env: { ...process.env, [CHILD_ENV]: "1" },
+				env: {
+					...process.env,
+					[CHILD_ENV]: "1",
+					[CAPTURE_SYSTEM_PROMPT_ENV]: path.join(historyPaths.dir, SYSTEM_PROMPT_CAPTURE_FILE_NAME),
+				},
 			});
 
 			let stdoutBuffer = "";

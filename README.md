@@ -28,12 +28,18 @@ There are two ways to delegate:
 
 ## Run history (follow a run in the browser)
 
-Every run persists its child session under the shared run history root
-(`$TMPDIR/pi-mydnicq-history/<session-uuid>/<agent-runId>/`) and re-exports it
-to HTML (pi's /export pipeline) while the run is in flight. The page includes
-the subagent's system prompt (the agent's Markdown body plus the appended
-`AGENTS.md`/`CLAUDE.md` context-file section when `projectContext` is on;
-pi's base prompt and skills are not shown) and its `tools` allowlist (rendered
+Every run persists its child session under the shared artifacts root
+(`$TMPDIR/pi-mydnicq-subagents/<session-uuid>/<agent-runId>/`; override the
+parent directory with `PI_MYDNICQ_SUBAGENTS_ARTIFACTS_DIR` — the root folder
+is always named `pi-mydnicq-subagents`) and re-exports it to HTML (pi's /export
+pipeline) while the run is in flight. The page includes the subagent's actual
+final system prompt — captured inside the child by a probe extension at
+`agent_start` (the complete prompt, pi's base prompt included, with
+modifications from any extension such as `.pi/AGENTS.md` sections appended by
+user-level extensions); until the capture lands it falls back to a
+reconstruction from the agent body plus the `AGENTS.md`/`CLAUDE.md`
+context-file section (`projectContext` off shows the body only) — and its
+`tools` allowlist (rendered
 with pi's builtin tool descriptions and parameters). One shared loopback server serves
 all pi sessions by path (discovered via a global `server.json` registry; a
 failed probe makes the next session claim a fresh port), and the subagent run
