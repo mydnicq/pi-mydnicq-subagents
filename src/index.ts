@@ -9,14 +9,18 @@ import type {
 import { getMarkdownTheme } from "@earendil-works/pi-coding-agent";
 import { Container, Markdown, Text, getCapabilities, hyperlink } from "@earendil-works/pi-tui";
 import { pathToFileURL } from "node:url";
+import * as path from "node:path";
 import { Type, type Static } from "typebox";
 import { loadProjectAgents, type AgentDefinition, type AgentLoadResult } from "./loader.ts";
 import {
 	CHILD_ENV,
+	DEFAULT_STOP_REASON,
 	formatUsage,
 	isFailedRun,
+	listActiveSubagentRuns,
 	runSubagent,
 	serializeForkContext,
+	type StoppableSubagentRun,
 	type SubagentRunDetails,
 } from "./runner.ts";
 
@@ -46,8 +50,8 @@ function emptyDetails(agent: string, task: string): SubagentRunDetails {
 function buildToolDescription(roster: AgentLoadResult | null): string {
 	const base =
 		"Delegate a task to a named subagent. Runs the agent as an isolated pi child process " +
-		"(its own context window) with the agent's configured model, thinking level, and system " +
-		"prompt; returns the subagent's final text output.";
+		"(its own context window) with the agent's configured model, thinking level, tools " +
+		"allowlist, and system prompt; returns the subagent's final text output.";
 	const how =
 		"Agents are defined as Markdown files with YAML frontmatter in the project's .pi/agents " +
 		"directory; the frontmatter name field defines the agent name.";
@@ -107,6 +111,30 @@ function historyHintText(run: SubagentRunDetails): string {
 /** Gesture hint for opening the ↗ history link (herdr opens pane links on ctrl/cmd-click). */
 const HISTORY_OPEN_HINT = "(ctrl/cmd-click to open · refresh the page to see the latest export)";
 
+/** Key shown on an in-flight run card; pressing it stops the run in-process. */
+const STOP_KEY_HINT = "alt+s stop";
+
+/** Picker label for an active run: agent, task preview, short run id. */
+function stopOptionLabel(run: StoppableSubagentRun): string {
+	const shortId = path.basename(run.id).slice(-4);
+	return `${run.agent} — ${truncate(run.task.replace(/\s+/g, " "), 60)} (${shortId})`;
+}
+
+/** Plain-words line describing a user stop, for the run card. */
+function stopLineText(run: SubagentRunDetails): string {
+	const reason = run.stop?.reason ? ` — reason: ${truncate(run.stop.reason, 200)}` : "";
+	return `Stopped by user${reason}`;
+}
+
+/** Result text the main agent receives when a run is stopped via alt+s. */
+function stoppedRunMessage(run: SubagentRunDetails): string {
+	const partial = run.output?.trim();
+	return (
+		`Subagent "${run.agent}" was stopped by the user. Reason: ${run.stop?.reason ?? DEFAULT_STOP_REASON}.` +
+		(partial ? `\n\nPartial output before the stop:\n${truncate(partial, 1000)}` : "")
+	);
+}
+
 /** Tool execution: resolve the agent, spawn the child, return its final output. */
 async function executeDelegation(
 	params: SubagentToolInput,
@@ -143,6 +171,14 @@ async function executeDelegation(
 		signal,
 		onUpdate,
 	});
+	// Stopped via alt+s: a deliberate user action, so the main agent gets a
+	// normal result carrying the encoded reason instead of a thrown error.
+	if (run.stop) {
+		return {
+			content: [{ type: "text", text: stoppedRunMessage(run) }],
+			details: run,
+		};
+	}
 	if (isFailedRun(run)) throw new Error(failedRunMessage(run));
 
 	return {
@@ -165,6 +201,10 @@ async function runCommandDelegation(
 	try {
 		const run = await runSubagent({ agent, task, cwd: ctx.cwd, sessionUuid: ctx.sessionManager.getSessionId(), forkTranscript });
 		ctx.ui.setStatus("subagent", undefined);
+		if (run.stop) {
+			ctx.ui.notify(`Subagent "${run.agent}" stopped from its run card${run.stop.reason ? ` — ${run.stop.reason}` : ""}.`, "warning");
+			return;
+		}
 		if (isFailedRun(run)) {
 			ctx.ui.notify(failedRunMessage(run), "error");
 			return;
@@ -218,22 +258,32 @@ function registerSubagentTool(pi: ExtensionAPI, roster: AgentLoadResult | null):
 				return new Text(first?.type === "text" ? first.text : "(no output)", 0, 0);
 			}
 
+			const stopped = run.stop !== undefined;
 			const failed = isFailedRun(run);
-			const icon = failed ? theme.fg("error", "✗") : theme.fg("success", "✓");
+			const icon = stopped
+				? theme.fg("warning", "■")
+				: failed
+					? theme.fg("error", "✗")
+					: theme.fg("success", "✓");
 			const usage = formatUsage(run);
 			const historyLink = historyLinkText(run, theme);
+			// Stop affordance: press alt+s while the run is in flight (no browser).
+			const stopHint = isPartial && !failed && !stopped ? theme.fg("dim", ` · ${STOP_KEY_HINT}`) : undefined;
 			let header =
 				`${icon} ${theme.fg("toolTitle", theme.bold(run.agent))} ` +
 				theme.fg("muted", run.context) +
 				theme.fg("dim", usage ? ` · ${usage}` : "");
-			if (failed && run.stopReason) header += ` ${theme.fg("error", `[${run.stopReason}]`)}`;
+			if (stopped) header += ` ${theme.fg("warning", "[stopped]")}`;
+			else if (failed && run.stopReason) header += ` ${theme.fg("error", `[${run.stopReason}]`)}`;
 			if (historyLink) header += ` · ${historyLink}`;
+			if (stopHint) header += stopHint;
 
 			const output = run.output?.trim();
 			if (expanded && output) {
 				const container = new Container();
 				container.addChild(new Text(header, 0, 0));
-				if (historyLink) container.addChild(new Text(theme.fg("dim", HISTORY_OPEN_HINT), 0, 0));
+				if (stopped) container.addChild(new Text(theme.fg("muted", stopLineText(run)), 0, 0));
+				else if (historyLink) container.addChild(new Text(theme.fg("dim", HISTORY_OPEN_HINT), 0, 0));
 				else if (run.history) container.addChild(new Text(theme.fg("dim", historyHintText(run)), 0, 0));
 				if (failed && run.errorMessage) {
 					container.addChild(new Text(theme.fg("error", truncate(run.errorMessage, 1000)), 0, 0));
@@ -243,8 +293,11 @@ function registerSubagentTool(pi: ExtensionAPI, roster: AgentLoadResult | null):
 			}
 
 			let text = header;
-			if (failed && run.errorMessage) text += `\n${theme.fg("error", truncate(run.errorMessage, 300))}`;
-			else if (output) {
+			if (stopped) {
+				text += `\n${theme.fg("muted", stopLineText(run))}`;
+			} else if (failed && run.errorMessage) {
+				text += `\n${theme.fg("error", truncate(run.errorMessage, 300))}`;
+			} else if (output) {
 				const lines = output.split("\n").slice(0, 3).map((line) => truncate(line, 200));
 				text += `\n${theme.fg("toolOutput", lines.join("\n"))}`;
 				if (output.split("\n").length > 3) text += `\n${theme.fg("muted", "(Ctrl+O to expand)")}`;
@@ -263,6 +316,30 @@ export default function (pi: ExtensionAPI) {
 	if (process.env[CHILD_ENV] === "1") return;
 
 	registerSubagentTool(pi, null);
+
+	// alt+s — stop an in-flight subagent run. One run: instant stop with the
+	// encoded default reason. Several runs: a picker of the active ones.
+	pi.registerShortcut("alt+s", {
+		description: "Stop a running subagent",
+		handler: async (ctx) => {
+			const active = listActiveSubagentRuns();
+			if (active.length === 0) {
+				ctx.ui.notify("No subagent run in flight.", "warning");
+				return;
+			}
+			let target = active[0]!;
+			if (active.length > 1) {
+				const options = active.map((run) => stopOptionLabel(run));
+				const choice = await ctx.ui.select("Stop which subagent?", options, { timeout: 30_000 });
+				if (choice === undefined) return; // cancelled or timed out
+				const index = options.indexOf(choice);
+				if (index === -1) return;
+				target = active[index]!;
+			}
+			target.stop();
+			ctx.ui.notify(`Stopping ${target.agent} — the main agent receives the reason.`, "info");
+		},
+	});
 
 	pi.on("session_start", async (_event, ctx) => {
 		if (!ctx.isProjectTrusted()) return;

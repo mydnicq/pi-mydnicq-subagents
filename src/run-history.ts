@@ -4,7 +4,10 @@
  * Each run persists its child session under the shared run history root,
  * grouped by the parent session's uuid (<root>/<sessionUuid>/<runId>), and
  * re-exports that file to an HTML page as the run progresses, reusing pi's
- * built-in /export HTML pipeline. The subagent run card links to the page (one
+ * built-in /export HTML pipeline. The page carries the agent's system prompt
+ * and its `tools` allowlist (resolved to builtin pi tool definitions) so the
+ * browser view shows what the subagent could see and do. The subagent run
+ * card links to the page (one
  * shared loopback server for all pi sessions serves it by path) so the
  * transcript can be followed in a browser while the run is in flight.
  */
@@ -15,7 +18,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
-import { SessionManager } from "@earendil-works/pi-coding-agent";
+import { SessionManager, createCodingTools, createPowerShellTool } from "@earendil-works/pi-coding-agent";
 import { getPiInvocation } from "./pi-invocation.ts";
 import { RUN_HISTORY_ROOT, runHistoryPageUrl } from "./run-history-server.ts";
 
@@ -34,6 +37,27 @@ export interface RunHistoryPaths {
 	htmlFile: string;
 	/** URL path under the shared server: <sessionUuid>/<runId>. */
 	urlPath: string;
+}
+
+/** Tool metadata for the history page's "Available Tools" section. */
+export interface HistoryToolInfo {
+	name: string;
+	description: string;
+	parameters: unknown;
+}
+
+/**
+ * Resolve an agent's `tools` allowlist to builtin pi tool definitions (the
+ * loader guarantees every name is a builtin). Names without a matching
+ * definition — only possible if pi's builtin set changes under us — fall back
+ * to a bare name entry.
+ */
+export function historyToolInfos(cwd: string, tools: readonly string[]): HistoryToolInfo[] {
+	const byName = new Map<string, HistoryToolInfo>();
+	for (const tool of [...createCodingTools(cwd), createPowerShellTool(cwd)]) {
+		byName.set(tool.name, { name: tool.name, description: tool.description, parameters: tool.parameters });
+	}
+	return tools.map((name) => byName.get(name) ?? { name, description: name, parameters: undefined });
 }
 
 /** Outcome of the most recent HTML export attempt for a run. */
@@ -94,13 +118,17 @@ function findPiExportHtmlModule(): string | undefined {
  * the run is still writing the session. Throws on failure; callers decide
  * what to record.
  */
-export async function exportRunHistoryToHtml(paths: RunHistoryPaths, systemPrompt?: string): Promise<string> {
+export async function exportRunHistoryToHtml(
+	paths: RunHistoryPaths,
+	systemPrompt?: string,
+	tools?: HistoryToolInfo[],
+): Promise<string> {
 	const modulePath = findPiExportHtmlModule();
 	if (modulePath) {
 		const mod = (await import(modulePath)) as PiExportHtmlModule;
-		if (systemPrompt) {
+		if (systemPrompt || (tools && tools.length > 0)) {
 			const sm = SessionManager.open(paths.sessionFile);
-			return mod.exportSessionToHtml(sm, { systemPrompt }, { outputPath: paths.htmlFile });
+			return mod.exportSessionToHtml(sm, { systemPrompt, tools }, { outputPath: paths.htmlFile });
 		}
 		return mod.exportFromFile(paths.sessionFile, { outputPath: paths.htmlFile });
 	}
@@ -140,21 +168,23 @@ export function createRunHistoryPaths(sessionUuid: string, agentName: string): R
 export class RunHistoryExporter {
 	private readonly paths: RunHistoryPaths;
 	private readonly systemPrompt: string | undefined;
+	private readonly tools: HistoryToolInfo[] | undefined;
 	private lastExportStartedAt = 0;
 	private inFlight: Promise<RunHistoryStatus> | null = null;
 	private trailingRequest = false;
 	private status: RunHistoryStatus;
 
-	constructor(paths: RunHistoryPaths, url: string | undefined, systemPrompt?: string) {
+	constructor(paths: RunHistoryPaths, url: string | undefined, systemPrompt?: string, tools?: HistoryToolInfo[]) {
 		this.paths = paths;
 		this.systemPrompt = systemPrompt;
+		this.tools = tools;
 		this.status = { htmlFile: paths.htmlFile, url };
 	}
 
 	/** Create the exporter and resolve its page URL on the shared server. */
-	static async create(paths: RunHistoryPaths, systemPrompt?: string): Promise<RunHistoryExporter> {
+	static async create(paths: RunHistoryPaths, systemPrompt?: string, tools?: HistoryToolInfo[]): Promise<RunHistoryExporter> {
 		const url = await runHistoryPageUrl(paths.urlPath);
-		return new RunHistoryExporter(paths, url, systemPrompt);
+		return new RunHistoryExporter(paths, url, systemPrompt, tools);
 	}
 
 	/** Current export outcome; read this (not a cached copy) when emitting updates. */
@@ -190,7 +220,7 @@ export class RunHistoryExporter {
 
 	private async runExport(): Promise<RunHistoryStatus> {
 		try {
-			await exportRunHistoryToHtml(this.paths, this.systemPrompt);
+			await exportRunHistoryToHtml(this.paths, this.systemPrompt, this.tools);
 			this.status = { htmlFile: this.paths.htmlFile, url: this.status.url };
 		} catch (error) {
 			this.status = {

@@ -10,6 +10,7 @@
  *   model: anthropic/claude-sonnet-4-5
  *   thinking: high
  *   context: fork
+ *   tools: read, bash, edit, write, grep, find, ls
  *   ---
  *   System prompt goes here.
  *
@@ -32,8 +33,16 @@ export type AgentThinkingLevel = (typeof THINKING_LEVELS)[number];
 export const CONTEXT_MODES = ["fresh", "fork"] as const;
 export type AgentContextMode = (typeof CONTEXT_MODES)[number];
 
+/**
+ * Builtin pi tool names accepted in frontmatter `tools` (powershell is
+ * Windows-only). The child runs with exactly this allowlist via pi's --tools
+ * flag; there are no defaults.
+ */
+export const BUILTIN_TOOLS = ["read", "bash", "edit", "write", "grep", "find", "ls", "powershell"] as const;
+export type BuiltinToolName = (typeof BUILTIN_TOOLS)[number];
+
 /** Frontmatter fields understood by this loader; anything else produces a warning. */
-const KNOWN_FIELDS = new Set(["name", "description", "model", "thinking", "context"]);
+const KNOWN_FIELDS = new Set(["name", "description", "model", "thinking", "context", "tools"]);
 
 /** A single agent definition parsed from a .md file. */
 export interface AgentDefinition {
@@ -47,6 +56,8 @@ export interface AgentDefinition {
 	thinking: AgentThinkingLevel;
 	/** How the child inherits context: "fresh" = new session, "fork" = branch from the parent session. */
 	context: AgentContextMode;
+	/** Builtin pi tools the child may use, passed as the child's --tools allowlist. */
+	tools: BuiltinToolName[];
 	/** System prompt (the Markdown body). */
 	systemPrompt: string;
 }
@@ -70,6 +81,31 @@ export interface AgentLoadResult {
 const FRONTMATTER_RE = /^---\r?\n([\s\S]*?)\r?\n---(?:\r?\n|$)/;
 /** Agent names come from file names; keep them tool-parameter safe. */
 const NAME_RE = /^[a-z0-9][a-z0-9_-]*$/;
+
+/**
+ * Parse a frontmatter `tools` value into a deduped, order-preserving list of
+ * tool names. Accepts a comma-separated string or a YAML list. Returns null
+ * when nothing usable remains (missing, wrong type, or no names).
+ */
+export function parseToolList(raw: unknown): string[] | null {
+	let names: string[];
+	if (typeof raw === "string") {
+		names = raw.split(",");
+	} else if (Array.isArray(raw)) {
+		names = raw.map((item) => (typeof item === "string" ? item : ""));
+	} else {
+		return null;
+	}
+	const seen = new Set<string>();
+	const out: string[] = [];
+	for (const item of names) {
+		const name = item.trim();
+		if (!name || seen.has(name)) continue;
+		seen.add(name);
+		out.push(name);
+	}
+	return out.length > 0 ? out : null;
+}
 
 /** Split a raw file into frontmatter source and body. frontmatter is null when absent. */
 export function splitFrontmatter(raw: string): { frontmatter: string | null; body: string } {
@@ -164,6 +200,24 @@ export function parseAgentDefinition(file: string, raw: string): {
 		return fail(`Invalid "context" value "${contextRaw}" — expected "fresh" or "fork".`);
 	}
 
+	// `tools` is required: the child gets exactly this allowlist via pi's --tools flag.
+	const toolsRaw = record.tools;
+	const tools = parseToolList(toolsRaw);
+	if (tools === null) {
+		return fail(
+			toolsRaw === undefined || toolsRaw === null
+				? 'Missing required frontmatter field "tools" — builtin tool names, comma-separated.'
+				: 'Invalid "tools" value — expected a comma-separated list of builtin tool names.',
+		);
+	}
+	const unknownTools = tools.filter((tool) => !(BUILTIN_TOOLS as readonly string[]).includes(tool));
+	if (unknownTools.length > 0) {
+		return fail(
+			`Invalid "tools" value — unknown tool "${unknownTools.join(", ")}". ` +
+				`Builtin tool names: ${BUILTIN_TOOLS.join(", ")}.`,
+		);
+	}
+
 	if (body.trim() === "") {
 		warnings.push({ file, message: "Empty system prompt (Markdown body is empty)." });
 	}
@@ -175,6 +229,7 @@ export function parseAgentDefinition(file: string, raw: string): {
 			model: model.trim(),
 			thinking: thinking as AgentThinkingLevel,
 			context: context as AgentContextMode,
+			tools: tools as BuiltinToolName[],
 			systemPrompt: body,
 		},
 		warnings,

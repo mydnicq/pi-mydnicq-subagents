@@ -4,7 +4,7 @@
  * Each delegation spawns a fresh `pi` child process in JSON print mode:
  *
  *   pi --mode json -p --session <run-history-session-file> --model <model> \
- *      --thinking <level> [--append-system-prompt <file>] "<prompt>"
+ *      --thinking <level> --tools <allowlist> [--append-system-prompt <file>] "<prompt>"
  *
  * The child persists its session to a private run-history temp file so the
  * transcript can be exported to HTML and followed in a browser while the run
@@ -14,6 +14,9 @@
  * Nested delegation is disabled by construction: children run with
  * PI_MYDNICQ_SUBAGENT_CHILD=1 and the extension refuses to register the
  * subagent tool in child processes.
+ *
+ * The child's tool set is the agent's frontmatter `tools` allowlist (builtin pi
+ * tool names only, required — no defaults), passed as pi's --tools flag.
  *
  * Fork context (`context: fork` in the agent frontmatter) is implemented as a
  * serialized transcript of the parent conversation, prepended to the child's
@@ -34,7 +37,12 @@ import type {
 } from "@earendil-works/pi-coding-agent";
 import type { AgentDefinition } from "./loader.ts";
 import { getPiInvocation } from "./pi-invocation.ts";
-import { RunHistoryExporter, createRunHistoryPaths, type RunHistoryStatus } from "./run-history.ts";
+import {
+	RunHistoryExporter,
+	createRunHistoryPaths,
+	historyToolInfos,
+	type RunHistoryStatus,
+} from "./run-history.ts";
 
 /** Env var set on child pi processes; the extension skips tool registration when it is present. */
 export const CHILD_ENV = "PI_MYDNICQ_SUBAGENT_CHILD";
@@ -80,6 +88,8 @@ export interface SubagentRunDetails {
 	output: string;
 	/** One-line description of the most recent child activity, for progress display. */
 	lastActivity?: string;
+	/** Present when the run was stopped from the run card's ■ stop link. */
+	stop?: { by: "user"; reason?: string };
 	/** Run history export state; present once the child session file exists. */
 	history?: RunHistoryStatus;
 	usage: SubagentUsageStats;
@@ -132,6 +142,28 @@ function formatTokens(count: number): string {
 	if (count < 1000) return String(count);
 	if (count < 1_000_000) return `${(count / 1000).toFixed(1)}k`;
 	return `${(count / 1_000_000).toFixed(1)}M`;
+}
+
+/** An in-flight subagent run that can be stopped from the extension UI. */
+export interface StoppableSubagentRun {
+	/** Run directory under the shared root — stable, unique id. */
+	id: string;
+	agent: string;
+	/** The delegated task text (for picker labels). */
+	task: string;
+	/** Kill the child process; the run is marked user-stopped. */
+	stop(): void;
+}
+
+/** Encoded reason reported to the main agent when a run is stopped without a user-provided one. */
+export const DEFAULT_STOP_REASON = "user requested stop";
+
+/** Registry of runs currently in flight in this process, keyed by run dir. */
+const activeSubagentRuns = new Map<string, StoppableSubagentRun>();
+
+/** Snapshot of the subagent runs currently in flight in this process. */
+export function listActiveSubagentRuns(): StoppableSubagentRun[] {
+	return [...activeSubagentRuns.values()];
 }
 
 /** Write the agent's system prompt to a 0600 temp file for --append-system-prompt. */
@@ -195,7 +227,10 @@ function parseChildEvent(line: string): ChildEvent | null {
 /**
  * Run a subagent as a child pi process and return its outcome.
  *
- * Throws when the run is aborted via `signal`. All other failures (non-zero
+ * Throws when the run is aborted via `signal` (Esc). A stop via the keyboard
+ * shortcut (alt+s → stopActiveSubagentRuns) is not a throw: the child is
+ * killed and the run is returned with `stop` set and the default reason, so
+ * the caller can report it to the main agent. All other failures (non-zero
  * exit, child-reported error) are returned as a failed run — callers decide
  * how to surface them.
  */
@@ -218,7 +253,25 @@ export async function runSubagent(options: SubagentRunOptions): Promise<Subagent
 	// the parent session uuid, so the transcript can be served by path and
 	// followed in a browser while the run is in flight (run-history.ts).
 	const historyPaths = createRunHistoryPaths(options.sessionUuid, agent.name);
-	const history = await RunHistoryExporter.create(historyPaths, agent.systemPrompt);
+	const history = await RunHistoryExporter.create(
+		historyPaths,
+		agent.systemPrompt,
+		historyToolInfos(cwd, agent.tools),
+	);
+
+	// Run card stop support: in-flight runs register themselves so the alt+s
+	// keyboard shortcut can stop them in-process (no browser, encoded default
+	// reason). The tool's own signal (Esc) still aborts via `signal`.
+	let stoppedByUser = false;
+	let settled = false;
+	let requestKill: (() => void) | null = null;
+	const stop = (): void => {
+		if (settled) return;
+		stoppedByUser = true;
+		requestKill?.();
+	};
+	const activeEntry: StoppableSubagentRun = { id: historyPaths.dir, agent: agent.name, task, stop };
+	activeSubagentRuns.set(activeEntry.id, activeEntry);
 
 	const args: string[] = [
 		"--mode",
@@ -230,6 +283,8 @@ export async function runSubagent(options: SubagentRunOptions): Promise<Subagent
 		agent.model,
 		"--thinking",
 		agent.thinking,
+		"--tools",
+		agent.tools.join(","),
 	];
 
 	let tmp: { dir: string; file: string } | null = null;
@@ -249,8 +304,12 @@ export async function runSubagent(options: SubagentRunOptions): Promise<Subagent
 			});
 		};
 
-		// Export right away so the run card link works from the first update.
+		// Export right away and emit the first update immediately, so the run
+		// card (and its ■ stop link) exists from spawn — not only after the
+		// child's first message_end event, which for 1-turn agents is also its
+		// last (the link would never appear).
 		history.scheduleExport();
+		emitUpdate();
 
 		const invocation = getPiInvocation(args);
 		const exitCode = await new Promise<number>((resolve) => {
@@ -271,6 +330,8 @@ export async function runSubagent(options: SubagentRunOptions): Promise<Subagent
 					if (!proc.killed) proc.kill("SIGKILL");
 				}, 5000);
 			};
+			// The stop watcher lives outside this scope; expose the kill path to it.
+			requestKill = killProc;
 			if (signal) {
 				if (signal.aborted) killProc();
 				else signal.addEventListener("abort", killProc, { once: true });
@@ -331,6 +392,7 @@ export async function runSubagent(options: SubagentRunOptions): Promise<Subagent
 			});
 
 			proc.on("close", (code) => {
+				settled = true;
 				if (stdoutBuffer.trim()) {
 					const event = parseChildEvent(stdoutBuffer);
 					if (event) handleEvent(event);
@@ -347,9 +409,13 @@ export async function runSubagent(options: SubagentRunOptions): Promise<Subagent
 		run.exitCode = exitCode;
 		// Final export regardless of the throttle window, including aborted runs.
 		run.history = await history.flushExport();
-		if (signal?.aborted) throw new Error("Subagent was aborted");
+		if (stoppedByUser) {
+			run.stop = { by: "user", reason: DEFAULT_STOP_REASON };
+			run.stopReason = run.stopReason ?? "aborted";
+		} else if (signal?.aborted) throw new Error("Subagent was aborted");
 		return run;
 	} finally {
+		activeSubagentRuns.delete(activeEntry.id);
 		cleanupPromptFile(tmp);
 	}
 }
