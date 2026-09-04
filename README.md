@@ -31,8 +31,10 @@ There are two ways to delegate:
 Every run persists its child session under the shared run history root
 (`$TMPDIR/pi-mydnicq-history/<session-uuid>/<agent-runId>/`) and re-exports it
 to HTML (pi's /export pipeline) while the run is in flight. The page includes
-the subagent's system prompt and its `tools` allowlist (rendered with pi's
-builtin tool descriptions and parameters). One shared loopback server serves
+the subagent's system prompt (the agent's Markdown body plus the appended
+`AGENTS.md`/`CLAUDE.md` context-file section when `projectContext` is on;
+pi's base prompt and skills are not shown) and its `tools` allowlist (rendered
+with pi's builtin tool descriptions and parameters). One shared loopback server serves
 all pi sessions by path (discovered via a global `server.json` registry; a
 failed probe makes the next session claim a fresh port), and the subagent run
 card shows a **↗ history** link to the run's page under the parent session's
@@ -61,6 +63,7 @@ model: anthropic/claude-sonnet-4-5
 thinking: high
 context: fork
 tools: read, bash, edit, write, grep, find, ls
+projectContext: true
 ---
 
 You are a code reviewer. ...
@@ -82,11 +85,12 @@ You are a code reviewer. ...
     names: `read`, `bash`, `edit`, `write`, `grep`, `find`, `ls`,
     `powershell` (Windows-only). There are no defaults — omitting `tools` or
     naming an unknown tool is a load error.
-    - `fresh` — brand-new session; the child only sees the delegated task
-    - `fork` — the child's prompt is prefixed with a serialized transcript of
-      the parent conversation (tool calls summarized, thinking dropped, tail
-      truncated at ~48k chars); the child still runs in a fresh ephemeral
-      session and no parent session files are touched
+- One optional frontmatter field:
+  - `projectContext` — whether the child loads context files (`AGENTS.md`/
+    `CLAUDE.md`) and appends them to its system prompt via pi's own discovery
+    (global `~/.pi/agent/AGENTS.md`, ancestor directories, current directory —
+    identical to the main agent). Default `true`. Set `projectContext: false`
+    to spawn the child with `--no-context-files` so it runs without them.
 - The Markdown body is the agent's system prompt.
 - The frontmatter `name` field defines the agent name; the file name is
   organizational only — naming the file after the agent is recommended.

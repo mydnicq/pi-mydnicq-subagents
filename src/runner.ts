@@ -4,7 +4,8 @@
  * Each delegation spawns a fresh `pi` child process in JSON print mode:
  *
  *   pi --mode json -p --session <run-history-session-file> --model <model> \
- *      --thinking <level> --tools <allowlist> [--append-system-prompt <file>] "<prompt>"
+ *      --thinking <level> --tools <allowlist> [--no-context-files]
+ *      [--append-system-prompt <file>] "<prompt>"
  *
  * The child persists its session to a private run-history temp file so the
  * transcript can be exported to HTML and followed in a browser while the run
@@ -36,6 +37,7 @@ import type {
 	SessionMessageEntry,
 } from "@earendil-works/pi-coding-agent";
 import type { AgentDefinition } from "./loader.ts";
+import { composeHistorySystemPrompt } from "./loader.ts";
 import { getPiInvocation } from "./pi-invocation.ts";
 import {
 	RunHistoryExporter,
@@ -273,7 +275,7 @@ export async function runSubagent(options: SubagentRunOptions): Promise<Subagent
 	const historyPaths = createRunHistoryPaths(options.sessionUuid, agent.name);
 	const history = await RunHistoryExporter.create(
 		historyPaths,
-		agent.systemPrompt,
+		composeHistorySystemPrompt(agent, cwd),
 		historyToolInfos(cwd, agent.tools),
 	);
 
@@ -304,6 +306,12 @@ export async function runSubagent(options: SubagentRunOptions): Promise<Subagent
 		"--tools",
 		agent.tools.join(","),
 	];
+
+	// Context files (AGENTS.md/CLAUDE.md): the child pi process discovers and
+	// appends them itself unless the agent opted out with projectContext: false.
+	if (!agent.projectContext) {
+		args.push("--no-context-files");
+	}
 
 	let tmp: { dir: string; file: string } | null = null;
 	try {

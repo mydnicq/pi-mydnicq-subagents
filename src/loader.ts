@@ -11,6 +11,7 @@
  *   thinking: high
  *   context: fork
  *   tools: read, bash, edit, write, grep, find, ls
+ *   projectContext: true
  *   ---
  *   System prompt goes here.
  *
@@ -21,7 +22,7 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { parse as parseYaml } from "yaml";
-import { CONFIG_DIR_NAME } from "@earendil-works/pi-coding-agent";
+import { CONFIG_DIR_NAME, getAgentDir, loadProjectContextFiles } from "@earendil-works/pi-coding-agent";
 
 /** Subdirectory of the project config dir that holds agent files. */
 export const AGENTS_DIR_NAME = "agents";
@@ -42,7 +43,7 @@ export const BUILTIN_TOOLS = ["read", "bash", "edit", "write", "grep", "find", "
 export type BuiltinToolName = (typeof BUILTIN_TOOLS)[number];
 
 /** Frontmatter fields understood by this loader; anything else produces a warning. */
-const KNOWN_FIELDS = new Set(["name", "description", "model", "thinking", "context", "tools"]);
+const KNOWN_FIELDS = new Set(["name", "description", "model", "thinking", "context", "tools", "projectContext"]);
 
 /** A single agent definition parsed from a .md file. */
 export interface AgentDefinition {
@@ -58,6 +59,8 @@ export interface AgentDefinition {
 	context: AgentContextMode;
 	/** Builtin pi tools the child may use, passed as the child's --tools allowlist. */
 	tools: BuiltinToolName[];
+	/** Whether the child loads context files (AGENTS.md/CLAUDE.md) via pi's own discovery. Default true. */
+	projectContext: boolean;
 	/** System prompt (the Markdown body). */
 	systemPrompt: string;
 }
@@ -218,6 +221,15 @@ export function parseAgentDefinition(file: string, raw: string): {
 		);
 	}
 
+	// `projectContext` is optional: whether the child pi process loads context
+	// files (AGENTS.md/CLAUDE.md, discovery identical to the main agent).
+	// Defaults to true; `false` spawns the child with --no-context-files.
+	const projectContextRaw = record.projectContext;
+	if (projectContextRaw !== undefined && typeof projectContextRaw !== "boolean") {
+		return fail('Invalid "projectContext" value — expected true or false.');
+	}
+	const projectContext = projectContextRaw !== false;
+
 	if (body.trim() === "") {
 		warnings.push({ file, message: "Empty system prompt (Markdown body is empty)." });
 	}
@@ -230,6 +242,7 @@ export function parseAgentDefinition(file: string, raw: string): {
 			thinking: thinking as AgentThinkingLevel,
 			context: context as AgentContextMode,
 			tools: tools as BuiltinToolName[],
+			projectContext,
 			systemPrompt: body,
 		},
 		warnings,
@@ -301,6 +314,25 @@ export function loadProjectAgents(cwd: string): AgentLoadResult {
 	}
 
 	return result;
+}
+
+/**
+ * Compose the system prompt shown on the run-history page: the agent's
+ * Markdown body plus — when the agent loads context files — the exact
+ * <project_context> section pi's buildSystemPrompt appends in the child,
+ * discovered with pi's own loadProjectContextFiles (global ~/.pi/agent,
+ * ancestors, cwd). The child's full prompt also carries pi's base prompt and
+ * skills, which the extension does not replicate here.
+ */
+export function composeHistorySystemPrompt(agent: AgentDefinition, cwd: string): string {
+	if (!agent.projectContext) return agent.systemPrompt;
+	const contextFiles = loadProjectContextFiles({ cwd, agentDir: getAgentDir() });
+	if (contextFiles.length === 0) return agent.systemPrompt;
+	let prompt = `${agent.systemPrompt}\n\n<project_context\u003e\n\nProject-specific instructions and guidelines:\n\n`;
+	for (const { path: filePath, content } of contextFiles) {
+		prompt += `<project_instructions path="${filePath}">\n${content}\n</project_instructions\u003e\n\n`;
+	}
+	return `${prompt}</project_context\u003e\n`;
 }
 
 function isDirectory(p: string): boolean {

@@ -5,8 +5,9 @@
  * grouped by the parent session's uuid (<root>/<sessionUuid>/<runId>), and
  * re-exports that file to an HTML page as the run progresses, reusing pi's
  * built-in /export HTML pipeline. The page carries the agent's system prompt
- * and its `tools` allowlist (resolved to builtin pi tool definitions) so the
- * browser view shows what the subagent could see and do. The subagent run
+ * (body plus the appended context-file section — see composeHistorySystemPrompt
+ * in loader.ts) and its `tools` allowlist (resolved to builtin pi tool
+ * definitions) so the browser view shows what the subagent could see and do. The subagent run
  * card links to the page (one
  * shared loopback server for all pi sessions serves it by path) so the
  * transcript can be followed in a browser while the run is in flight.
