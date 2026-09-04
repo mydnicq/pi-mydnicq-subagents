@@ -5,7 +5,7 @@ description: Run tests for this project's pi extension in an isolated live pi se
 
 # Test env: isolated pi session in a herdr pane
 
-Goal: a pi session in a split pane that loads THIS repo's extension without installing it (`pi -a -e .`), with `pi-subagents` disabled (its `subagent` tool would collide).
+Goal: a pi session in a split pane that loads THIS repo's extension without installing it (`pi -a -e .`).
 
 ## A. Environment already set up (check first)
 
@@ -21,22 +21,13 @@ Goal: a pi session in a split pane that loads THIS repo's extension without inst
 ## B. Fresh setup
 
 1. Preconditions: `HERDR_ENV=1`, cwd = repo root. Stop if not inside herdr.
-2. Ensure `.pi/settings.json` exists with this content (merge, don't clobber, if the file already exists):
-   ```json
-   {
-     "packages": [
-       { "source": "npm:pi-subagents", "extensions": [], "skills": [], "prompts": [], "themes": [] }
-     ]
-   }
-   ```
-   Object entry + empty arrays = replace global package with all resources disabled. Do NOT add `autoload: false` (that keeps the package loaded).
-3. Ensure test fixtures exist: `.pi/agents/<name>.md` (frontmatter: name, description, model, thinking, context — all required). `ping.md` is the canonical smoke-test agent.
-4. Find your own pane (`herdr pane list` → `focused: true`), then split right:
+2. Ensure test fixtures exist: `.pi/agents/<name>.md` (frontmatter: name, description, model, thinking, context — all required). `ping.md` is the canonical smoke-test agent.
+3. Find your own pane (`herdr pane list` → `focused: true`), then split right:
    ```bash
    NEW_PANE=$(herdr pane split <my-pane> --direction right --no-focus | jq -er '.result.pane.pane_id')
    herdr pane rename "$NEW_PANE" ext-test   # label survives pi restarts; makes pane findable in A.1
    ```
-5. Launch pi (uninstalled extension, trusted project files, default model from user settings):
+4. Launch pi (uninstalled extension, trusted project files, default model from user settings):
    ```bash
    herdr pane run "$NEW_PANE" "cd <repo-root> && pi -a -e ."
    ```
@@ -50,8 +41,6 @@ Goal: a pi session in a split pane that loads THIS repo's extension without inst
    Exit code 0 = ready; timeout = still starting (retry once) or dead (relaunch).
 2. Check the `[Extensions]` block:
    - local extension listed (appears as `src`)
-   - `pi-subagents` absent
-   - no `Tool "subagent" conflicts` error (hard startup failure → pi-subagents was not disabled; fix `.pi/settings.json`)
 3. Functional check: `herdr pane run <pane> "/subagents"`, then read the pane — it must list agents from `.pi/agents` (e.g. `ping — Trivial test agent ...`).
 
 ## Running a test
