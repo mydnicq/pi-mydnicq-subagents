@@ -40,7 +40,7 @@ function handleHistoryRequest(req: http.IncomingMessage, res: http.ServerRespons
 	const match = new RegExp(`^/(${PATH_SEGMENT_PATTERN})/(${PATH_SEGMENT_PATTERN})/history\\.html$`)
 		.exec((req.url ?? "").split("?")[0]);
 	if (!match) {
-		res.writeHead(404, { "Content-Type": "text/plain" });
+		res.writeHead(404, { "Content-Type": "text/plain; charset=utf-8" });
 		res.end("Run history not found");
 		return;
 	}
@@ -50,8 +50,10 @@ function handleHistoryRequest(req: http.IncomingMessage, res: http.ServerRespons
 	try {
 		html = fs.readFileSync(path.join(runDir, "history.html"), "utf8");
 	} catch {
-		res.writeHead(404, { "Content-Type": "text/plain" });
-		res.end("Run history not exported yet — try again in a moment");
+		res.writeHead(404, { "Content-Type": "text/plain; charset=utf-8" });
+		// ASCII-only body: text/plain responses may be decoded with a legacy
+		// charset when the browser ignores the header, which mangles UTF-8 dashes.
+		res.end("Run history not exported yet - try again in a moment");
 		return;
 	}
 	res.writeHead(200, { "Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-store" });

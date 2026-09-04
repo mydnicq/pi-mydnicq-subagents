@@ -74,8 +74,11 @@ export interface SubagentRunDetails {
 	task: string;
 	/** Effective context mode: "fork" only when a non-empty transcript was provided. */
 	context: "fresh" | "fork";
-	/** Model string passed to the child, e.g. "anthropic/claude-sonnet-4-5". */
+	/** Model string passed to the child, e.g. "anthropic/claude-sonnet-4-5". Overwritten
+	 *  with the child-reported bare model id once the first assistant message arrives. */
 	model: string;
+	/** Provider of the model actually used; from the configured reference, then the child. */
+	provider?: string;
 	/** Child process exit code. */
 	exitCode: number;
 	/** Final assistant stopReason, when known ("stop", "error", "aborted", ...). */
@@ -127,6 +130,19 @@ export function isFailedRun(run: SubagentRunDetails): boolean {
 	return run.exitCode !== 0 || run.stopReason === "error" || run.stopReason === "aborted";
 }
 
+/** Split a "provider/model-id" reference into its provider prefix and bare model id. */
+export function splitModelRef(ref: string): { provider?: string; modelId: string } {
+	const slash = ref.indexOf("/");
+	if (slash === -1) return { modelId: ref };
+	return { provider: ref.slice(0, slash) || undefined, modelId: ref.slice(slash + 1) };
+}
+
+/** Canonical "provider/model" display reference for a run's model. */
+export function subagentModelRef(run: SubagentRunDetails): string {
+	if (run.provider && run.model && !run.model.includes("/")) return `${run.provider}/${run.model}`;
+	return run.model;
+}
+
 /** Human-readable usage summary, e.g. "3 turns ↑1.2k ↓800 $0.0123". */
 export function formatUsage(run: SubagentRunDetails): string {
 	const parts: string[] = [];
@@ -138,7 +154,8 @@ export function formatUsage(run: SubagentRunDetails): string {
 	return parts.join(" ");
 }
 
-function formatTokens(count: number): string {
+/** Compact token count, e.g. "800", "1.2k", "1.5M". */
+export function formatTokens(count: number): string {
 	if (count < 1000) return String(count);
 	if (count < 1_000_000) return `${(count / 1000).toFixed(1)}k`;
 	return `${(count / 1_000_000).toFixed(1)}M`;
@@ -243,6 +260,7 @@ export async function runSubagent(options: SubagentRunOptions): Promise<Subagent
 		task,
 		context: forkTranscript ? "fork" : "fresh",
 		model: agent.model,
+		provider: splitModelRef(agent.model).provider,
 		exitCode: 0,
 		stderr: "",
 		output: "",
@@ -339,7 +357,7 @@ export async function runSubagent(options: SubagentRunOptions): Promise<Subagent
 
 			const handleEvent = (event: ChildEvent) => {
 				if (event.type !== "message_end" || !event.message) return;
-				const message = event.message as { role?: unknown; content?: unknown; stopReason?: unknown; errorMessage?: unknown; usage?: Record<string, unknown>; model?: unknown };
+				const message = event.message as { role?: unknown; content?: unknown; stopReason?: unknown; errorMessage?: unknown; usage?: Record<string, unknown>; model?: unknown; provider?: unknown };
 				if (message.role !== "assistant") return;
 
 				// Throttled re-export of the growing transcript for the run history page.
@@ -361,6 +379,7 @@ export async function runSubagent(options: SubagentRunOptions): Promise<Subagent
 				if (typeof message.stopReason === "string") run.stopReason = message.stopReason;
 				if (typeof message.errorMessage === "string" && message.errorMessage) run.errorMessage = message.errorMessage;
 				if (typeof message.model === "string" && message.model) run.model = message.model;
+				if (typeof message.provider === "string" && message.provider) run.provider = message.provider;
 
 				// Track the final output and a short "current activity" line.
 				const blocks = Array.isArray(message.content) ? (message.content as ContentBlock[]) : [];

@@ -4,6 +4,7 @@ import type {
 	ExtensionAPI,
 	ExtensionCommandContext,
 	ExtensionContext,
+	ModelRegistry,
 	Theme,
 } from "@earendil-works/pi-coding-agent";
 import { getMarkdownTheme } from "@earendil-works/pi-coding-agent";
@@ -15,11 +16,14 @@ import { loadProjectAgents, type AgentDefinition, type AgentLoadResult } from ".
 import {
 	CHILD_ENV,
 	DEFAULT_STOP_REASON,
+	formatTokens,
 	formatUsage,
 	isFailedRun,
 	listActiveSubagentRuns,
 	runSubagent,
 	serializeForkContext,
+	splitModelRef,
+	subagentModelRef,
 	type StoppableSubagentRun,
 	type SubagentRunDetails,
 } from "./runner.ts";
@@ -33,6 +37,32 @@ export type SubagentToolInput = Static<typeof subagentSchema>;
 
 /** Roster cached at session_start so slash-command autocomplete stays trust-safe. */
 let cachedRoster: AgentLoadResult | null = null;
+
+/**
+ * Parent-session model registry, captured from the first extension context we
+ * see. Needed to resolve a run's model to its context window for the card's
+ * context-usage percentage; absent until a context arrives (percent omitted).
+ */
+let modelRegistry: ModelRegistry | undefined;
+
+function rememberModelRegistry(ctx: ExtensionContext): void {
+	modelRegistry ??= ctx.modelRegistry;
+}
+
+/**
+ * "ctx NN% of WINDOW" for the run card header — the child's latest context
+ * token count as a share of the model's context window. Empty when the model
+ * is unknown to pi's registry (no known window) or nothing is counted yet.
+ */
+function contextUsageText(run: SubagentRunDetails): string {
+	if (!modelRegistry) return "";
+	const { provider, modelId } = splitModelRef(subagentModelRef(run));
+	const model = provider ? modelRegistry.find(provider, modelId) : undefined;
+	if (!model || !(model.contextWindow > 0) || run.usage.contextTokens <= 0) return "";
+	const percent = (run.usage.contextTokens / model.contextWindow) * 100;
+	const label = percent >= 1 ? `${Math.round(percent)}%` : "<1%";
+	return `ctx ${label} of ${formatTokens(model.contextWindow)}`;
+}
 
 function emptyDetails(agent: string, task: string): SubagentRunDetails {
 	return {
@@ -158,6 +188,7 @@ async function executeDelegation(
 		};
 	}
 
+	rememberModelRegistry(ctx);
 	// fork-context agents receive the parent conversation as a serialized transcript.
 	const forkTranscript =
 		agent.context === "fork" ? serializeForkContext(ctx.sessionManager.buildContextEntries()) || undefined : undefined;
@@ -197,6 +228,7 @@ async function runCommandDelegation(
 	const forkTranscript =
 		agent.context === "fork" ? serializeForkContext(ctx.sessionManager.buildContextEntries()) || undefined : undefined;
 
+	rememberModelRegistry(ctx);
 	ctx.ui.setStatus("subagent", `${agent.name}: running${forkTranscript ? " (fork)" : ""}`);
 	try {
 		const run = await runSubagent({ agent, task, cwd: ctx.cwd, sessionUuid: ctx.sessionManager.getSessionId(), forkTranscript });
@@ -215,7 +247,7 @@ async function runCommandDelegation(
 		await pi.sendMessage(
 			{
 				customType: "subagent-result",
-				content: `Subagent "${run.agent}" (${run.context}, ${run.model}) finished with:\n\n${run.output || "(no output)"}`,
+				content: `Subagent "${run.agent}" (${run.context}, ${subagentModelRef(run)}) finished with:\n\n${run.output || "(no output)"}`,
 				display: true,
 				details: run,
 			},
@@ -266,13 +298,18 @@ function registerSubagentTool(pi: ExtensionAPI, roster: AgentLoadResult | null):
 					? theme.fg("error", "✗")
 					: theme.fg("success", "✓");
 			const usage = formatUsage(run);
+			const ctxUsage = contextUsageText(run);
+			const modelRef = subagentModelRef(run);
 			const historyLink = historyLinkText(run, theme);
 			// Stop affordance: press alt+s while the run is in flight (no browser).
 			const stopHint = isPartial && !failed && !stopped ? theme.fg("dim", ` · ${STOP_KEY_HINT}`) : undefined;
-			let header =
-				`${icon} ${theme.fg("toolTitle", theme.bold(run.agent))} ` +
-				theme.fg("muted", run.context) +
-				theme.fg("dim", usage ? ` · ${usage}` : "");
+			const segments = [
+				theme.fg("muted", run.context),
+				...(modelRef ? [theme.fg("muted", modelRef)] : []),
+				...(usage ? [theme.fg("dim", usage)] : []),
+				...(ctxUsage ? [theme.fg("dim", ctxUsage)] : []),
+			];
+			let header = `${icon} ${theme.fg("toolTitle", theme.bold(run.agent))} ${segments.join(" · ")}`;
 			if (stopped) header += ` ${theme.fg("warning", "[stopped]")}`;
 			else if (failed && run.stopReason) header += ` ${theme.fg("error", `[${run.stopReason}]`)}`;
 			if (historyLink) header += ` · ${historyLink}`;
@@ -343,6 +380,7 @@ export default function (pi: ExtensionAPI) {
 
 	pi.on("session_start", async (_event, ctx) => {
 		if (!ctx.isProjectTrusted()) return;
+		rememberModelRegistry(ctx);
 		const result = loadProjectAgents(ctx.cwd);
 		cachedRoster = result;
 		for (const d of result.errors) ctx.ui.notify(`${d.file}: ${d.message}`, "error");
