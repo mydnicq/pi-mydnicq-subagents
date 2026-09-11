@@ -7,7 +7,7 @@
   "author": "tadejstanic",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/tadejstanic/pi-mydnicq-subagents.git"
+    "url": "git+https://github.com/mydnicq/pi-mydnicq-subagents.git"
   },
   "keywords": [
     "pi-package",
