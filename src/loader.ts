@@ -34,14 +34,6 @@ export type AgentThinkingLevel = (typeof THINKING_LEVELS)[number];
 export const CONTEXT_MODES = ["fresh", "fork"] as const;
 export type AgentContextMode = (typeof CONTEXT_MODES)[number];
 
-/**
- * Builtin pi tool names accepted in frontmatter `tools` (powershell is
- * Windows-only). The child runs with exactly this allowlist via pi's --tools
- * flag; there are no defaults.
- */
-export const BUILTIN_TOOLS = ["read", "bash", "edit", "write", "grep", "find", "ls", "powershell"] as const;
-export type BuiltinToolName = (typeof BUILTIN_TOOLS)[number];
-
 /** Frontmatter fields understood by this loader; anything else produces a warning. */
 const KNOWN_FIELDS = new Set(["name", "description", "model", "thinking", "context", "tools", "projectContext"]);
 
@@ -57,8 +49,8 @@ export interface AgentDefinition {
 	thinking: AgentThinkingLevel;
 	/** How the child inherits context: "fresh" = new session, "fork" = branch from the parent session. */
 	context: AgentContextMode;
-	/** Builtin pi tools the child may use, passed as the child's --tools allowlist. */
-	tools: BuiltinToolName[];
+	/** Tool names (builtin or extension) the child may use, passed as the child's --tools allowlist. */
+	tools: string[];
 	/** Whether the child loads context files (AGENTS.md/CLAUDE.md) via pi's own discovery. Default true. */
 	projectContext: boolean;
 	/** System prompt (the Markdown body). */
@@ -204,20 +196,15 @@ export function parseAgentDefinition(file: string, raw: string): {
 	}
 
 	// `tools` is required: the child gets exactly this allowlist via pi's --tools flag.
+	// Non-builtin names are extension/custom tools; the child-side probe fails the
+	// run if any of them are not active when the child starts.
 	const toolsRaw = record.tools;
 	const tools = parseToolList(toolsRaw);
 	if (tools === null) {
 		return fail(
 			toolsRaw === undefined || toolsRaw === null
-				? 'Missing required frontmatter field "tools" — builtin tool names, comma-separated.'
-				: 'Invalid "tools" value — expected a comma-separated list of builtin tool names.',
-		);
-	}
-	const unknownTools = tools.filter((tool) => !(BUILTIN_TOOLS as readonly string[]).includes(tool));
-	if (unknownTools.length > 0) {
-		return fail(
-			`Invalid "tools" value — unknown tool "${unknownTools.join(", ")}". ` +
-				`Builtin tool names: ${BUILTIN_TOOLS.join(", ")}.`,
+				? 'Missing required frontmatter field "tools" — tool names, comma-separated.'
+				: 'Invalid "tools" value — expected a comma-separated list of tool names.',
 		);
 	}
 
@@ -241,7 +228,7 @@ export function parseAgentDefinition(file: string, raw: string): {
 			model: model.trim(),
 			thinking: thinking as AgentThinkingLevel,
 			context: context as AgentContextMode,
-			tools: tools as BuiltinToolName[],
+			tools,
 			projectContext,
 			systemPrompt: body,
 		},

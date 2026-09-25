@@ -56,7 +56,7 @@ You are a code reviewer. ...
 | `model` | yes | Model the child runs with.<br><br>Values: `provider/model-id`<br><br>Default: none (required) |
 | `thinking` | yes | Thinking level for the child.<br><br>Values: `off`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`<br><br>Default: none (required) |
 | `context` | yes | How the child inherits parent context:<br>`fresh` — brand-new session; the child only sees the delegated task.<br>`fork` — the child's prompt is prefixed with a serialized transcript of the parent conversation (tool calls summarized, thinking dropped, tail truncated at ~48k chars); the child still runs in a fresh ephemeral session and no parent session files are touched.<br><br>Values: `fresh`, `fork`<br><br>Default: none (required) |
-| `tools` | yes | Builtin pi tool allowlist the child runs with.<br><br>Values: `read`, `bash`, `edit`, `write`, `grep`, `find`, `ls`, `powershell` (Windows-only), comma-separated or YAML list; unknown names are a load error.<br><br>Default: none (required) |
+| `tools` | yes | Tool allowlist the child runs with.<br><br>Values: builtin pi tool names `read`, `bash`, `edit`, `write`, `grep`, `find`, `ls`, `powershell` (Windows-only), plus extension/custom tool names registered in the child (e.g. `executor_execute`), comma-separated or YAML list. A declared tool that is not active in the child fails the run before the first model turn.<br><br>Default: none (required) |
 | `projectContext` | no | Whether the child loads `AGENTS.md`/`CLAUDE.md` context files and appends them to its system prompt (discovery identical to the main agent).<br><br>Values: `true`, `false`<br><br>Default: `true` |
 
 ## Install

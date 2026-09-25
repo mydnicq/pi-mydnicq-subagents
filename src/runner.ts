@@ -38,7 +38,7 @@ import type {
 import type { AgentDefinition } from "./loader.ts";
 import { composeHistorySystemPrompt } from "./loader.ts";
 import { getPiInvocation } from "./pi-invocation.ts";
-import { CAPTURE_SYSTEM_PROMPT_ENV } from "./child-prompt-probe.ts";
+import { CAPTURE_SYSTEM_PROMPT_ENV, EXPECTED_TOOLS_ENV } from "./child-prompt-probe.ts";
 import { ARTIFACTS_ROOT, CHILD_PROMPT_PROBE_PATH, SYSTEM_PROMPT_CAPTURE_FILE_NAME } from "./constants.ts";
 import {
 	RunHistoryExporter,
@@ -416,6 +416,7 @@ async function executeChildRun(spec: ChildRunSpec): Promise<SubagentRunDetails> 
 					...process.env,
 					[CHILD_ENV]: "1",
 					[CAPTURE_SYSTEM_PROMPT_ENV]: path.join(historyPaths.dir, SYSTEM_PROMPT_CAPTURE_FILE_NAME),
+					[EXPECTED_TOOLS_ENV]: config.tools.join(","),
 				},
 			});
 			spec.onSpawn?.(proc.pid ?? null);

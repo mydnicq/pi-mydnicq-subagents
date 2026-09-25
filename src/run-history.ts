@@ -51,10 +51,9 @@ export interface HistoryToolInfo {
 }
 
 /**
- * Resolve an agent's `tools` allowlist to builtin pi tool definitions (the
- * loader guarantees every name is a builtin). Names without a matching
- * definition — only possible if pi's builtin set changes under us — fall back
- * to a bare name entry.
+ * Resolve an agent's `tools` allowlist to tool definitions: builtin pi tools
+ * get their real schema, extension/custom names (e.g. `executor_execute`) fall
+ * back to a bare name entry.
  */
 export function historyToolInfos(cwd: string, tools: readonly string[]): HistoryToolInfo[] {
 	const byName = new Map<string, HistoryToolInfo>();
