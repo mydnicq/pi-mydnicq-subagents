@@ -10,6 +10,7 @@ import type {
 import { getMarkdownTheme } from "@earendil-works/pi-coding-agent";
 import { Container, Markdown, Text, getCapabilities, hyperlink } from "@earendil-works/pi-tui";
 import { pathToFileURL } from "node:url";
+import * as fs from "node:fs";
 import * as path from "node:path";
 import { Type, type Static } from "typebox";
 import { loadProjectAgents, type AgentDefinition, type AgentLoadResult } from "./loader.ts";
@@ -20,6 +21,7 @@ import {
 	formatUsage,
 	isFailedRun,
 	listActiveSubagentRuns,
+	resumeSubagent,
 	runSubagent,
 	serializeForkContext,
 	splitModelRef,
@@ -27,13 +29,43 @@ import {
 	type StoppableSubagentRun,
 	type SubagentRunDetails,
 } from "./runner.ts";
+import { runHistoryPathsFor } from "./run-history.ts";
+import { runHistoryPageUrl } from "./run-history-server.ts";
+import {
+	displayStatus,
+	listRuns,
+	resolveRun,
+	resumability,
+	runIsInFlight,
+	type KnownRun,
+	type RunRecord,
+} from "./run-store.ts";
 
 const subagentSchema = Type.Object({
-	agent: Type.String({ description: "Name of the agent to run" }),
-	task: Type.String({ description: "Task to delegate to the agent" }),
+	action: Type.Optional(
+		Type.Union([Type.Literal("run"), Type.Literal("resume"), Type.Literal("status")], {
+			description: '"run" (default) starts a new subagent run; "resume" continues a finished run; "status" lists this session\'s runs.',
+		}),
+	),
+	agent: Type.Optional(Type.String({ description: 'Agent to run; required for action "run".' })),
+	run: Type.Optional(
+		Type.String({ description: 'Run id to resume or inspect; required for "resume", optional for "status".' }),
+	),
+	task: Type.Optional(Type.String({ description: 'Task to delegate for "run", or follow-up task for "resume".' })),
 });
 
 export type SubagentToolInput = Static<typeof subagentSchema>;
+
+/** Marker details for text-only results (status reports and lookup errors). */
+export interface SubagentTextDetails {
+	kind: "text";
+}
+
+/** Union of all `subagent` tool result details. */
+export type SubagentToolDetails = SubagentRunDetails | SubagentTextDetails;
+
+/** Maximum runs shown by the status listing. */
+const MAX_STATUS_RUNS = 10;
 
 /** Roster cached at session_start so slash-command autocomplete stays trust-safe. */
 let cachedRoster: AgentLoadResult | null = null;
@@ -79,18 +111,23 @@ function emptyDetails(agent: string, task: string): SubagentRunDetails {
 
 function buildToolDescription(roster: AgentLoadResult | null): string {
 	const base =
-		"Delegate a task to a named subagent. Runs the agent as an isolated pi child process " +
-		"(its own context window) with the agent's configured model, thinking level, tools " +
-		"allowlist, and system prompt; returns the subagent's final text output.";
+		"Delegate work to a named subagent, continue a finished subagent run, or inspect this " +
+		"session's runs. Each run is an isolated pi child process (its own context window) with " +
+		"the agent's configured model, thinking level, tools allowlist, and system prompt.";
+	const actions =
+		"Actions:\n" +
+		'- { action: "run", agent, task } (default) — start a new run; the result ends with its run id.\n' +
+		'- { action: "resume", run, task } — append follow-up work to a finished run (complete or failed), keeping its full context. Refused for stopped or in-flight runs.\n' +
+		'- { action: "status" } — list this session\'s runs; add "run" to show one.';
 	const how =
 		"Agents are defined as Markdown files with YAML frontmatter in the project's .pi/agents " +
 		"directory; the frontmatter name field defines the agent name.";
-	if (!roster) return `${base}\n\n${how}`;
+	if (!roster) return `${base}\n\n${actions}\n\n${how}`;
 	if (roster.agents.size === 0) {
-		return `${base}\n\nNo agents are currently configured in .pi/agents — calls fail until one is defined.\n\n${how}`;
+		return `${base}\n\n${actions}\n\nNo agents are currently configured in .pi/agents — run calls fail until one is defined.\n\n${how}`;
 	}
 	const lines = [...roster.agents].map(([name, a]) => `- ${name}: ${a.description}`);
-	return `${base}\n\nAvailable agents:\n${lines.join("\n")}`;
+	return `${base}\n\n${actions}\n\nAvailable agents:\n${lines.join("\n")}\n\n${how}`;
 }
 
 function unknownAgentText(name: string, roster: AgentLoadResult): string {
@@ -165,26 +202,122 @@ function stoppedRunMessage(run: SubagentRunDetails): string {
 	);
 }
 
-/** Tool execution: resolve the agent, spawn the child, return its final output. */
-async function executeDelegation(
+/** Plain-text tool result (status reports and lookup errors); rendered without a run card. */
+function textResult(text: string): AgentToolResult<SubagentToolDetails> {
+	return { content: [{ type: "text", text }], details: { kind: "text" } };
+}
+
+/** Compact run trailer the main agent uses to resume a finished run. */
+function runTrailer(run: SubagentRunDetails): string {
+	if (!run.runId || run.stop) return "";
+	const state = isFailedRun(run) ? "failed" : "complete";
+	const attempt = (run.attempt ?? 1) > 1 ? `, attempt ${run.attempt}` : "";
+	return `\n\n[run ${run.runId} (${state}${attempt}) — resume with subagent({action:"resume", run:"${run.runId}", task:"…"})]`;
+}
+
+function isDirectory(p: string): boolean {
+	try {
+		return fs.statSync(p).isDirectory();
+	} catch {
+		return false;
+	}
+}
+
+/** Relative time for run listings, e.g. "2m ago". */
+function timeAgo(iso: string): string {
+	const ms = Date.now() - Date.parse(iso);
+	if (!Number.isFinite(ms) || ms < 0) return "just now";
+	const seconds = Math.round(ms / 1000);
+	if (seconds < 60) return `${seconds}s ago`;
+	const minutes = Math.round(seconds / 60);
+	if (minutes < 60) return `${minutes}m ago`;
+	const hours = Math.round(minutes / 60);
+	if (hours < 24) return `${hours}h ago`;
+	return `${Math.round(hours / 24)}d ago`;
+}
+
+/** One-line task summary for status listings. */
+function taskSummary(task: string): string {
+	return truncate(task.replace(/\s+/g, " ").trim(), 80) || "(no task)";
+}
+
+/** "resumable" / "not resumable (reason)" label for a run record. */
+function resumabilityLabel(run: KnownRun): string {
+	const result = resumability(run.record, run.dir);
+	return result.resumable ? "resumable" : `not resumable (${result.reason})`;
+}
+
+/** `status` list: every run of the current parent session, newest first. */
+function statusListText(runs: KnownRun[]): string {
+	if (runs.length === 0) return "No subagent runs in this session.";
+	const lines = ["Subagent runs in this session (newest first):", ""];
+	for (const run of runs.slice(0, MAX_STATUS_RUNS)) {
+		lines.push(
+			`${run.runId}  ${displayStatus(run.record)}  attempt ${run.record.tasks.length}  ${run.record.agent}  updated ${timeAgo(run.record.updatedAt)}  — ${resumabilityLabel(run)}`,
+		);
+		lines.push(`  task: ${taskSummary(run.record.tasks[0] ?? "")}`);
+		lines.push("");
+	}
+	return lines.join("\n").trimEnd();
+}
+
+/** `status <run>`: one run's contract, location, and attempt tasks. */
+async function statusDetailText(sessionUuid: string, runId: string, record: RunRecord): Promise<string> {
+	const paths = runHistoryPathsFor(sessionUuid, runId);
+	const history = (await runHistoryPageUrl(paths.urlPath)) ?? paths.htmlFile;
+	const attempts = record.tasks.length;
+	const countLabel = attempts > 1 ? `, ${attempts} attempts` : "";
+	return [
+		`Run ${runId} — ${record.agent} (${displayStatus(record)}${countLabel})`,
+		`cwd: ${record.cwd}`,
+		`model: ${record.agentContract.model} · thinking ${record.agentContract.thinking} · tools ${record.agentContract.tools.join(",")}`,
+		`history: ${history}`,
+		"",
+		"tasks:",
+		...record.tasks.map((task, index) => `  ${index + 1}. ${taskSummary(task)}`),
+	].join("\n");
+}
+
+/** Unknown run id: list the session's runs so the caller can pick one. */
+function unknownRunText(reference: string, runs: KnownRun[]): string {
+	if (runs.length === 0) return `Unknown subagent run "${reference}". No subagent runs in this session.`;
+	const lines = [`Unknown subagent run "${reference}". Runs in this session (newest first):`];
+	for (const { runId, record } of runs.slice(0, MAX_STATUS_RUNS)) {
+		lines.push(
+			`- ${runId} (${displayStatus(record)}, attempt ${record.tasks.length}) — ${taskSummary(record.tasks[0] ?? "")}`,
+		);
+	}
+	lines.push(`Pass a full id (or a unique prefix), e.g. subagent({action:"resume", run:"${runs[0]!.runId}", task:"…"})`);
+	return lines.join("\n");
+}
+
+function ambiguousRunText(reference: string, matches: string[]): string {
+	return [`Run id "${reference}" matches several runs:`, ...matches.map((match) => `- ${match}`), "Pass the full id."].join("\n");
+}
+
+function noRecordRunText(runId: string): string {
+	return `Run "${runId}" has no run record (created before resume support). Start a new run instead.`;
+}
+
+function invalidRecordRunText(runId: string, message: string): string {
+	return `Run "${runId}" has an unreadable run record (${message}). Start a new run instead.`;
+}
+
+/** "run" action: resolve the agent, spawn a fresh child, return its final output. */
+async function executeRun(
 	params: SubagentToolInput,
 	signal: AbortSignal | undefined,
 	onUpdate: AgentToolUpdateCallback<SubagentRunDetails> | undefined,
 	ctx: ExtensionContext,
-): Promise<AgentToolResult<SubagentRunDetails>> {
-	if (!ctx.isProjectTrusted()) {
-		return {
-			content: [{ type: "text", text: "Project is not trusted — refusing to read .pi/agents." }],
-			details: emptyDetails(params.agent, params.task),
-		};
-	}
-
+): Promise<AgentToolResult<SubagentToolDetails>> {
+	const agentName = params.agent?.trim() ?? "";
+	const task = params.task?.trim() ?? "";
 	const roster = loadProjectAgents(ctx.cwd);
-	const agent = roster.agents.get(params.agent);
+	const agent = roster.agents.get(agentName);
 	if (!agent) {
 		return {
-			content: [{ type: "text", text: unknownAgentText(params.agent, roster) }],
-			details: emptyDetails(params.agent, params.task),
+			content: [{ type: "text", text: unknownAgentText(agentName, roster) }],
+			details: emptyDetails(agentName, task),
 		};
 	}
 
@@ -195,7 +328,7 @@ async function executeDelegation(
 
 	const run = await runSubagent({
 		agent,
-		task: params.task,
+		task,
 		cwd: ctx.cwd,
 		sessionUuid: ctx.sessionManager.getSessionId(),
 		forkTranscript,
@@ -210,12 +343,108 @@ async function executeDelegation(
 			details: run,
 		};
 	}
-	if (isFailedRun(run)) throw new Error(failedRunMessage(run));
+	if (isFailedRun(run)) throw new Error(failedRunMessage(run) + runTrailer(run));
 
 	return {
-		content: [{ type: "text", text: run.output || "(no output)" }],
+		content: [{ type: "text", text: (run.output || "(no output)") + runTrailer(run) }],
 		details: run,
 	};
+}
+
+/** "resume" action: continue a finished run with a follow-up task. */
+async function executeResume(
+	params: SubagentToolInput,
+	signal: AbortSignal | undefined,
+	onUpdate: AgentToolUpdateCallback<SubagentRunDetails> | undefined,
+	ctx: ExtensionContext,
+): Promise<AgentToolResult<SubagentToolDetails>> {
+	const reference = params.run?.trim() ?? "";
+	const task = params.task?.trim() ?? "";
+	const sessionUuid = ctx.sessionManager.getSessionId();
+	const lookup = resolveRun(sessionUuid, reference);
+	if (lookup.kind === "unknown") return textResult(unknownRunText(reference, listRuns(sessionUuid)));
+	if (lookup.kind === "ambiguous") return textResult(ambiguousRunText(reference, lookup.matches));
+	if (lookup.kind === "no-record") return textResult(noRecordRunText(lookup.runId));
+	if (lookup.kind === "invalid-record") return textResult(invalidRecordRunText(lookup.runId, lookup.message));
+	const { runId, dir, record } = lookup;
+
+	if (params.agent && params.agent !== record.agent) {
+		return textResult(`Run ${runId} belongs to agent "${record.agent}", not "${params.agent}".`);
+	}
+	if (record.status === "stopped") {
+		return textResult(`Run ${runId} was stopped and cannot be resumed. Start a new run instead.`);
+	}
+	const inProcess = listActiveSubagentRuns().some((active) => active.id === dir);
+	if (inProcess || runIsInFlight(record)) {
+		return textResult(
+			`Run ${runId} is still in flight (started ${timeAgo(record.updatedAt)}). Wait for it to finish, or stop it (alt+s), then resume.`,
+		);
+	}
+	if (!fs.existsSync(path.join(dir, "session.jsonl"))) {
+		return textResult(`Run ${runId} cannot be resumed: its session file is missing. Start a new run instead.`);
+	}
+	if (!isDirectory(record.cwd)) {
+		return textResult(
+			`Run ${runId} cannot be resumed: its working directory no longer exists (${record.cwd}). Start a new run instead.`,
+		);
+	}
+
+	rememberModelRegistry(ctx);
+	const run = await resumeSubagent({ record, runDir: dir, sessionUuid, task, signal, onUpdate });
+	if (run.stop) {
+		return {
+			content: [{ type: "text", text: stoppedRunMessage(run) }],
+			details: run,
+		};
+	}
+	if (isFailedRun(run)) throw new Error(failedRunMessage(run) + runTrailer(run));
+
+	return {
+		content: [{ type: "text", text: (run.output || "(no output)") + runTrailer(run) }],
+		details: run,
+	};
+}
+
+/** "status" action: list this session's runs, or show one run in detail. */
+async function executeStatus(
+	params: SubagentToolInput,
+	ctx: ExtensionContext,
+): Promise<AgentToolResult<SubagentToolDetails>> {
+	const sessionUuid = ctx.sessionManager.getSessionId();
+	const reference = params.run?.trim();
+	if (reference) {
+		const lookup = resolveRun(sessionUuid, reference);
+		if (lookup.kind === "unknown") return textResult(unknownRunText(reference, listRuns(sessionUuid)));
+		if (lookup.kind === "ambiguous") return textResult(ambiguousRunText(reference, lookup.matches));
+		if (lookup.kind === "no-record") return textResult(noRecordRunText(lookup.runId));
+		if (lookup.kind === "invalid-record") return textResult(invalidRecordRunText(lookup.runId, lookup.message));
+		return textResult(await statusDetailText(sessionUuid, lookup.runId, lookup.record));
+	}
+	return textResult(statusListText(listRuns(sessionUuid)));
+}
+
+/** Tool execution: dispatch on the requested action after the trust gate. */
+async function executeDelegation(
+	params: SubagentToolInput,
+	signal: AbortSignal | undefined,
+	onUpdate: AgentToolUpdateCallback<SubagentRunDetails> | undefined,
+	ctx: ExtensionContext,
+): Promise<AgentToolResult<SubagentToolDetails>> {
+	const action = params.action ?? "run";
+	if (!ctx.isProjectTrusted()) {
+		const what =
+			action === "run" ? "read .pi/agents" : action === "resume" ? "resume subagent runs" : "list subagent runs";
+		return textResult(`Project is not trusted — refusing to ${what}.`);
+	}
+	if (action === "status") return executeStatus(params, ctx);
+	if (action === "resume") {
+		if (!params.run?.trim()) return textResult('subagent({action:"resume"}) requires the run id in "run".');
+		if (!params.task?.trim()) return textResult('subagent({action:"resume"}) requires the follow-up task in "task".');
+		return executeResume(params, signal, onUpdate, ctx);
+	}
+	if (!params.agent?.trim()) return textResult('subagent({action:"run"}) requires the agent name in "agent".');
+	if (!params.task?.trim()) return textResult('subagent({action:"run"}) requires the task in "task".');
+	return executeRun(params, signal, onUpdate, ctx);
 }
 
 /** Run a delegation from /subagent and inject the result into the session. */
@@ -262,33 +491,40 @@ async function runCommandDelegation(
 }
 
 function registerSubagentTool(pi: ExtensionAPI, roster: AgentLoadResult | null): void {
-	pi.registerTool({
+	pi.registerTool<typeof subagentSchema, SubagentToolDetails>({
 		name: "subagent",
 		label: "Subagent",
 		description: buildToolDescription(roster),
-		promptSnippet: "Delegate a task to a named subagent configured in .pi/agents.",
+		promptSnippet: "Delegate a task to a named subagent configured in .pi/agents, resume a finished run, or list this session's runs.",
 		promptGuidelines: [
 			"Use subagent when a task matches one of the configured subagent descriptions; pass the full, self-contained task text as task.",
+			'To give a finished subagent follow-up work that builds on what it already did, resume it with action "resume" and its run id instead of starting a new run.',
+			'Use action "status" when you need the run ids of subagents started earlier in this session.',
 		],
 		parameters: subagentSchema,
 		execute(_toolCallId, params, signal, onUpdate, ctx) {
 			return executeDelegation(params, signal, onUpdate, ctx);
 		},
 		renderCall(args, theme) {
+			const action = args.action ?? "run";
+			if (action === "status") {
+				const target = args.run ? ` ${theme.fg("accent", args.run)}` : "";
+				return new Text(`${theme.fg("toolTitle", theme.bold("subagent status"))}${target}`, 0, 0);
+			}
 			const preview = args.task ? truncate(args.task.replace(/\s+/g, " "), 60) : "...";
-			const text =
-				theme.fg("toolTitle", theme.bold("subagent ")) +
-				theme.fg("accent", args.agent) +
-				"\n  " +
-				theme.fg("dim", preview);
-			return new Text(text, 0, 0);
+			const head =
+				action === "resume"
+					? `${theme.fg("toolTitle", theme.bold("subagent ↩ "))}${theme.fg("accent", args.run ?? "")}`
+					: `${theme.fg("toolTitle", theme.bold("subagent "))}${theme.fg("accent", args.agent ?? "")}`;
+			return new Text(`${head}\n  ${theme.fg("dim", preview)}`, 0, 0);
 		},
 		renderResult(result, { expanded, isPartial }, theme) {
-			const run = result.details as SubagentRunDetails | undefined;
-			if (!run) {
+			const details = result.details;
+			if ("kind" in details) {
 				const first = result.content[0];
 				return new Text(first?.type === "text" ? first.text : "(no output)", 0, 0);
 			}
+			const run = details;
 
 			const stopped = run.stop !== undefined;
 			const failed = isFailedRun(run);
@@ -303,8 +539,13 @@ function registerSubagentTool(pi: ExtensionAPI, roster: AgentLoadResult | null):
 			const historyLink = historyLinkText(run, theme);
 			// Stop affordance: press alt+s while the run is in flight (no browser).
 			const stopHint = isPartial && !failed && !stopped ? theme.fg("dim", ` · ${STOP_KEY_HINT}`) : undefined;
+			const resumed = (run.attempt ?? 1) > 1;
 			const segments = [
-				theme.fg("muted", run.context),
+				...(resumed
+					? [theme.fg("muted", "resumed"), theme.fg("dim", `attempt ${run.attempt}`)]
+					: run.context
+						? [theme.fg("muted", run.context)]
+						: []),
 				...(modelRef ? [theme.fg("muted", modelRef)] : []),
 				...(usage ? [theme.fg("dim", usage)] : []),
 				...(ctxUsage ? [theme.fg("dim", ctxUsage)] : []),

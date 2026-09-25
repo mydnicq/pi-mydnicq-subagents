@@ -44,8 +44,17 @@ import {
 	RunHistoryExporter,
 	createRunHistoryPaths,
 	historyToolInfos,
+	runHistoryPathsFor,
+	type RunHistoryPaths,
 	type RunHistoryStatus,
 } from "./run-history.ts";
+import {
+	type RunAgentContract,
+	type RunRecord,
+	type RunStatus,
+	updateRunRecord,
+	writeRunRecord,
+} from "./run-store.ts";
 
 /** Env var set on child pi processes; the extension skips tool registration when it is present. */
 export const CHILD_ENV = "PI_MYDNICQ_SUBAGENT_CHILD";
@@ -73,10 +82,14 @@ export interface SubagentUsageStats {
 
 /** Full outcome of a subagent run. Used as the tool result `details` payload. */
 export interface SubagentRunDetails {
+	/** Stable run id (run directory basename); absent for pre-run validation failures. */
+	runId?: string;
+	/** 1 for the original delegation, 2+ for resume attempts. */
+	attempt?: number;
 	agent: string;
 	task: string;
-	/** Effective context mode: "fork" only when a non-empty transcript was provided. */
-	context: "fresh" | "fork";
+	/** Effective context mode for a fresh run; omitted on resume (context is the existing session). */
+	context?: "fresh" | "fork";
 	/** Model string passed to the child, e.g. "anthropic/claude-sonnet-4-5". Overwritten
 	 *  with the child-reported bare model id once the first assistant message arrives. */
 	model: string;
@@ -246,40 +259,88 @@ function parseChildEvent(line: string): ChildEvent | null {
 	return null;
 }
 
-/**
- * Run a subagent as a child pi process and return its outcome.
- *
- * Throws when the run is aborted via `signal` (Esc). A stop via the keyboard
- * shortcut (alt+s → stopActiveSubagentRuns) is not a throw: the child is
- * killed and the run is returned with `stop` set and the default reason, so
- * the caller can report it to the main agent. All other failures (non-zero
- * exit, child-reported error) are returned as a failed run — callers decide
- * how to surface them.
- */
-export async function runSubagent(options: SubagentRunOptions): Promise<SubagentRunDetails> {
-	const { agent, task, cwd, signal, onUpdate } = options;
-	const forkTranscript = options.forkTranscript?.trim() ? options.forkTranscript : undefined;
-
-	const run: SubagentRunDetails = {
-		agent: agent.name,
-		task,
-		context: forkTranscript ? "fork" : "fresh",
+/** Launch snapshot for a run: the agent config a resume replays exactly. */
+function agentContractOf(agent: AgentDefinition): RunAgentContract {
+	return {
 		model: agent.model,
-		provider: splitModelRef(agent.model).provider,
-		exitCode: 0,
-		stderr: "",
-		output: "",
-		usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, turns: 0, contextTokens: 0 },
+		thinking: agent.thinking,
+		tools: [...agent.tools],
+		projectContext: agent.projectContext,
+		systemPrompt: agent.systemPrompt,
 	};
+}
+
+/** Initial run record for a fresh delegation. */
+function newRunRecord(agent: AgentDefinition, cwd: string, task: string): RunRecord {
+	return {
+		version: 1,
+		agent: agent.name,
+		cwd,
+		status: "running",
+		updatedAt: new Date().toISOString(),
+		childPid: null,
+		agentContract: agentContractOf(agent),
+		tasks: [task],
+	};
+}
+
+/** Persist the settled outcome of a run. */
+function finalizeRunRecord(dir: string, run: SubagentRunDetails): void {
+	const status: RunStatus = run.stop ? "stopped" : isFailedRun(run) ? "failed" : "complete";
+	updateRunRecord(dir, { status, childPid: null, updatedAt: new Date().toISOString() });
+}
+
+/** Best-effort "failed" record update for runs that ended without a result (e.g. abort). */
+function failRunRecord(dir: string): void {
+	try {
+		updateRunRecord(dir, { status: "failed", childPid: null, updatedAt: new Date().toISOString() });
+	} catch {
+		/* best effort */
+	}
+}
+
+/** Best-effort child-pid persistence; a failed write must never affect the run. */
+function persistChildPid(dir: string, pid: number | null): void {
+	try {
+		updateRunRecord(dir, { childPid: pid });
+	} catch {
+		/* best effort */
+	}
+}
+
+/** Everything one child invocation needs; shared by fresh runs and resumes. */
+interface ChildRunSpec {
+	/** Pre-initialized outcome (agent, task, model, context/attempt identity). */
+	run: SubagentRunDetails;
+	/** Run directory layout: session file, HTML export, URL path. */
+	historyPaths: RunHistoryPaths;
+	/** Launch snapshot used for the child process and the history fallback prompt. */
+	config: RunAgentContract;
+	/** Fallback system prompt for the history page until the probe capture lands. */
+	fallbackSystemPrompt: string;
+	/** Full prompt passed to the child (fork transcript + task, or a resume follow-up). */
+	prompt: string;
+	cwd: string;
+	signal?: AbortSignal | undefined;
+	onUpdate?: AgentToolUpdateCallback<SubagentRunDetails> | undefined;
+	/** Called with the child pid right after spawn, so the run record can track it. */
+	onSpawn?: ((pid: number | null) => void) | undefined;
+}
+
+/** Spawn the child pi process for one invocation and collect its outcome. */
+async function executeChildRun(spec: ChildRunSpec): Promise<SubagentRunDetails> {
+	const { run, historyPaths, config, cwd } = spec;
+	const task = run.task;
+	const signal = spec.signal;
+	const onUpdate = spec.onUpdate;
 
 	// Persist the child session under the shared run history root, grouped by
 	// the parent session uuid, so the transcript can be served by path and
 	// followed in a browser while the run is in flight (run-history.ts).
-	const historyPaths = createRunHistoryPaths(options.sessionUuid, agent.name);
 	const history = await RunHistoryExporter.create(
 		historyPaths,
-		composeHistorySystemPrompt(agent, cwd),
-		historyToolInfos(cwd, agent.tools),
+		spec.fallbackSystemPrompt,
+		historyToolInfos(cwd, config.tools),
 	);
 
 	// Run card stop support: in-flight runs register themselves so the alt+s
@@ -293,7 +354,7 @@ export async function runSubagent(options: SubagentRunOptions): Promise<Subagent
 		stoppedByUser = true;
 		requestKill?.();
 	};
-	const activeEntry: StoppableSubagentRun = { id: historyPaths.dir, agent: agent.name, task, stop };
+	const activeEntry: StoppableSubagentRun = { id: historyPaths.dir, agent: run.agent, task, stop };
 	activeSubagentRuns.set(activeEntry.id, activeEntry);
 
 	const args: string[] = [
@@ -303,11 +364,11 @@ export async function runSubagent(options: SubagentRunOptions): Promise<Subagent
 		"--session",
 		historyPaths.sessionFile,
 		"--model",
-		agent.model,
+		config.model,
 		"--thinking",
-		agent.thinking,
+		config.thinking,
 		"--tools",
-		agent.tools.join(","),
+		config.tools.join(","),
 	];
 
 	// Child-side probe extension: captures the child's final chained system
@@ -317,18 +378,18 @@ export async function runSubagent(options: SubagentRunOptions): Promise<Subagent
 
 	// Context files (AGENTS.md/CLAUDE.md): the child pi process discovers and
 	// appends them itself unless the agent opted out with projectContext: false.
-	if (!agent.projectContext) {
+	if (!config.projectContext) {
 		args.push("--no-context-files");
 	}
 
 	let tmp: { dir: string; file: string } | null = null;
 	try {
-		if (agent.systemPrompt.trim()) {
-			tmp = await writeSystemPromptFile(agent.name, agent.systemPrompt);
+		if (config.systemPrompt.trim()) {
+			tmp = await writeSystemPromptFile(run.agent, config.systemPrompt);
 			args.push("--append-system-prompt", tmp.file);
 		}
 
-		args.push(forkTranscript ? `${forkTranscript}\n\n---\n\n# Task\n\n${task}` : task);
+		args.push(spec.prompt);
 
 		const emitUpdate = () => {
 			run.history = history.getStatus();
@@ -357,6 +418,7 @@ export async function runSubagent(options: SubagentRunOptions): Promise<Subagent
 					[CAPTURE_SYSTEM_PROMPT_ENV]: path.join(historyPaths.dir, SYSTEM_PROMPT_CAPTURE_FILE_NAME),
 				},
 			});
+			spec.onSpawn?.(proc.pid ?? null);
 
 			let stdoutBuffer = "";
 			let aborted = false;
@@ -459,8 +521,120 @@ export async function runSubagent(options: SubagentRunOptions): Promise<Subagent
 	}
 }
 
+/**
+ * Run a subagent as a child pi process and return its outcome.
+ *
+ * Throws when the run is aborted via `signal` (Esc). A stop via the keyboard
+ * shortcut (alt+s → stopActiveSubagentRuns) is not a throw: the child is
+ * killed and the run is returned with `stop` set and the default reason, so
+ * the caller can report it to the main agent. All other failures (non-zero
+ * exit, child-reported error) are returned as a failed run — callers decide
+ * how to surface them.
+ */
+export async function runSubagent(options: SubagentRunOptions): Promise<SubagentRunDetails> {
+	const { agent, task, cwd, signal, onUpdate } = options;
+	const forkTranscript = options.forkTranscript?.trim() ? options.forkTranscript : undefined;
+
+	const historyPaths = createRunHistoryPaths(options.sessionUuid, agent.name);
+	const run: SubagentRunDetails = {
+		runId: path.basename(historyPaths.dir),
+		attempt: 1,
+		agent: agent.name,
+		task,
+		context: forkTranscript ? "fork" : "fresh",
+		model: agent.model,
+		provider: splitModelRef(agent.model).provider,
+		exitCode: 0,
+		stderr: "",
+		output: "",
+		usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, turns: 0, contextTokens: 0 },
+	};
+
+	writeRunRecord(historyPaths.dir, newRunRecord(agent, cwd, task));
+	try {
+		const done = await executeChildRun({
+			run,
+			historyPaths,
+			config: agentContractOf(agent),
+			fallbackSystemPrompt: composeHistorySystemPrompt(agent, cwd),
+			prompt: forkTranscript ? `${forkTranscript}\n\n---\n\n# Task\n\n${task}` : task,
+			cwd,
+			signal,
+			onUpdate,
+			onSpawn: (pid) => persistChildPid(historyPaths.dir, pid),
+		});
+		finalizeRunRecord(historyPaths.dir, done);
+		return done;
+	} catch (error) {
+		failRunRecord(historyPaths.dir);
+		throw error;
+	}
+}
+
+/** Options for continuing a finished run with a follow-up task. */
+export interface ResumeSubagentOptions {
+	/** Record read from the run directory; already validated by the caller. */
+	record: RunRecord;
+	/** Absolute run directory under the parent session's artifacts dir. */
+	runDir: string;
+	/** Parent session uuid, used to rebuild the history URL path. */
+	sessionUuid: string;
+	task: string;
+	signal?: AbortSignal | undefined;
+	onUpdate?: AgentToolUpdateCallback<SubagentRunDetails> | undefined;
+}
+
+/**
+ * Continue a finished run: spawn a child on the run's existing session file
+ * (`pi --session <file>` continues it in place) with the launch snapshot as
+ * the agent contract, and record the follow-up as a new attempt.
+ */
+export async function resumeSubagent(options: ResumeSubagentOptions): Promise<SubagentRunDetails> {
+	const { record, runDir, task } = options;
+	const contract = record.agentContract;
+	const historyPaths = runHistoryPathsFor(options.sessionUuid, path.basename(runDir));
+	const run: SubagentRunDetails = {
+		runId: path.basename(runDir),
+		attempt: record.tasks.length + 1,
+		agent: record.agent,
+		task,
+		model: contract.model,
+		provider: splitModelRef(contract.model).provider,
+		exitCode: 0,
+		stderr: "",
+		output: "",
+		usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, turns: 0, contextTokens: 0 },
+	};
+
+	updateRunRecord(runDir, {
+		status: "running",
+		childPid: null,
+		updatedAt: new Date().toISOString(),
+		tasks: [...record.tasks, task],
+	});
+	try {
+		const done = await executeChildRun({
+			run,
+			historyPaths,
+			config: contract,
+			fallbackSystemPrompt: contract.systemPrompt,
+			prompt: task,
+			cwd: record.cwd,
+			signal: options.signal,
+			onUpdate: options.onUpdate,
+			onSpawn: (pid) => persistChildPid(runDir, pid),
+		});
+		finalizeRunRecord(runDir, done);
+		return done;
+	} catch (error) {
+		failRunRecord(runDir);
+		throw error;
+	}
+}
+
 function progressText(run: SubagentRunDetails): string {
-	const parts = [`Subagent "${run.agent}" running (${run.context})`];
+	const mode = (run.attempt ?? 1) > 1 ? `resumed, attempt ${run.attempt}` : run.context ?? "fresh";
+	const parts = [`Subagent "${run.agent}" running (${mode})`];
 	if (run.usage.turns > 0) parts.push(`turn ${run.usage.turns}`);
 	if (run.lastActivity) parts.push(run.lastActivity);
 	return parts.join(" · ");

@@ -146,6 +146,23 @@ function sanitizePathSegment(value: string): string {
 	return value.replace(/[^0-9A-Za-z_-]/g, "_");
 }
 
+/** Absolute directory holding one parent session's run dirs: <root>/<sessionUuid>. */
+export function sessionArtifactsDir(sessionUuid: string): string {
+	return path.join(ARTIFACTS_ROOT, sanitizePathSegment(sessionUuid));
+}
+
+/** Path layout for a known run id inside a parent session's artifacts directory. */
+export function runHistoryPathsFor(sessionUuid: string, runId: string): RunHistoryPaths {
+	const sessionSegment = sanitizePathSegment(sessionUuid);
+	const dir = path.join(ARTIFACTS_ROOT, sessionSegment, runId);
+	return {
+		dir,
+		sessionFile: path.join(dir, "session.jsonl"),
+		htmlFile: path.join(dir, "history.html"),
+		urlPath: `${sessionSegment}/${runId}`,
+	};
+}
+
 /**
  * Create the run directory under the shared run history root, grouped by the
  * parent session's uuid so every session's runs are linked under its id:
@@ -153,14 +170,9 @@ function sanitizePathSegment(value: string): string {
  */
 export function createRunHistoryPaths(sessionUuid: string, agentName: string): RunHistoryPaths {
 	const runId = `${sanitizePathSegment(agentName)}-${randomBytes(4).toString("hex")}`;
-	const dir = path.join(ARTIFACTS_ROOT, sanitizePathSegment(sessionUuid), runId);
-	fs.mkdirSync(dir, { recursive: true });
-	return {
-		dir,
-		sessionFile: path.join(dir, "session.jsonl"),
-		htmlFile: path.join(dir, "history.html"),
-		urlPath: `${sanitizePathSegment(sessionUuid)}/${runId}`,
-	};
+	const paths = runHistoryPathsFor(sessionUuid, runId);
+	fs.mkdirSync(paths.dir, { recursive: true });
+	return paths;
 }
 
 /**
