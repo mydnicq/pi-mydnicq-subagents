@@ -50,6 +50,7 @@ import {
 } from "./run-history.ts";
 import {
 	type RunAgentContract,
+	type RunOutcome,
 	type RunRecord,
 	type RunStatus,
 	updateRunRecord,
@@ -284,10 +285,24 @@ function newRunRecord(agent: AgentDefinition, cwd: string, task: string): RunRec
 	};
 }
 
+/** Persisted outcome of a settled run; the safety net behind the completion message. */
+function outcomeOf(run: SubagentRunDetails): RunOutcome {
+	return {
+		exitCode: run.exitCode,
+		output: run.output,
+		stderr: run.stderr,
+		...(run.stopReason ? { stopReason: run.stopReason } : {}),
+		...(run.errorMessage ? { errorMessage: run.errorMessage } : {}),
+		...(run.stop ? { stop: run.stop } : {}),
+		usage: { ...run.usage },
+		finishedAt: new Date().toISOString(),
+	};
+}
+
 /** Persist the settled outcome of a run. */
 function finalizeRunRecord(dir: string, run: SubagentRunDetails): void {
 	const status: RunStatus = run.stop ? "stopped" : isFailedRun(run) ? "failed" : "complete";
-	updateRunRecord(dir, { status, childPid: null, updatedAt: new Date().toISOString() });
+	updateRunRecord(dir, { status, childPid: null, result: outcomeOf(run), updatedAt: new Date().toISOString() });
 }
 
 /** Best-effort "failed" record update for runs that ended without a result (e.g. abort). */
@@ -522,17 +537,27 @@ async function executeChildRun(spec: ChildRunSpec): Promise<SubagentRunDetails> 
 	}
 }
 
+/** A launched run: its identity exists before this returns; `done` settles with the outcome. */
+export interface StartedSubagentRun {
+	/** Run directory basename — the stable run id used by status and resume. */
+	runId: string;
+	/** Absolute run directory under the parent session's artifacts dir. */
+	dir: string;
+	/** Mutable live run state, updated by the child event stream until it settles. */
+	details: SubagentRunDetails;
+	/** Resolves with the outcome, or rejects when the run was aborted or could not start. */
+	done: Promise<SubagentRunDetails>;
+}
+
 /**
- * Run a subagent as a child pi process and return its outcome.
+ * Start a subagent run and return at once.
  *
- * Throws when the run is aborted via `signal` (Esc). A stop via the keyboard
- * shortcut (alt+s → stopActiveSubagentRuns) is not a throw: the child is
- * killed and the run is returned with `stop` set and the default reason, so
- * the caller can report it to the main agent. All other failures (non-zero
- * exit, child-reported error) are returned as a failed run — callers decide
- * how to surface them.
+ * The run directory and record are written before this returns, so the caller
+ * can report the run id while the child is still starting. The caller owns the
+ * abort signal and collects the outcome from `done`; the stored record and
+ * outcome are the recovery path when that outcome cannot be delivered.
  */
-export async function runSubagent(options: SubagentRunOptions): Promise<SubagentRunDetails> {
+export function startSubagent(options: SubagentRunOptions): StartedSubagentRun {
 	const { agent, task, cwd, signal, onUpdate } = options;
 	const forkTranscript = options.forkTranscript?.trim() ? options.forkTranscript : undefined;
 
@@ -552,24 +577,27 @@ export async function runSubagent(options: SubagentRunOptions): Promise<Subagent
 	};
 
 	writeRunRecord(historyPaths.dir, newRunRecord(agent, cwd, task));
-	try {
-		const done = await executeChildRun({
-			run,
-			historyPaths,
-			config: agentContractOf(agent),
-			fallbackSystemPrompt: composeHistorySystemPrompt(agent, cwd),
-			prompt: forkTranscript ? `${forkTranscript}\n\n---\n\n# Task\n\n${task}` : task,
-			cwd,
-			signal,
-			onUpdate,
-			onSpawn: (pid) => persistChildPid(historyPaths.dir, pid),
-		});
-		finalizeRunRecord(historyPaths.dir, done);
-		return done;
-	} catch (error) {
-		failRunRecord(historyPaths.dir);
-		throw error;
-	}
+	const done = (async (): Promise<SubagentRunDetails> => {
+		try {
+			const result = await executeChildRun({
+				run,
+				historyPaths,
+				config: agentContractOf(agent),
+				fallbackSystemPrompt: composeHistorySystemPrompt(agent, cwd),
+				prompt: forkTranscript ? `${forkTranscript}\n\n---\n\n# Task\n\n${task}` : task,
+				cwd,
+				signal,
+				onUpdate,
+				onSpawn: (pid) => persistChildPid(historyPaths.dir, pid),
+			});
+			finalizeRunRecord(historyPaths.dir, result);
+			return result;
+		} catch (error) {
+			failRunRecord(historyPaths.dir);
+			throw error;
+		}
+	})();
+	return { runId: path.basename(historyPaths.dir), dir: historyPaths.dir, details: run, done };
 }
 
 /** Options for continuing a finished run with a follow-up task. */
@@ -588,9 +616,10 @@ export interface ResumeSubagentOptions {
 /**
  * Continue a finished run: spawn a child on the run's existing session file
  * (`pi --session <file>` continues it in place) with the launch snapshot as
- * the agent contract, and record the follow-up as a new attempt.
+ * the agent contract, and record the follow-up as a new attempt. Returns at
+ * once; the caller collects the outcome from `done`.
  */
-export async function resumeSubagent(options: ResumeSubagentOptions): Promise<SubagentRunDetails> {
+export function startResume(options: ResumeSubagentOptions): StartedSubagentRun {
 	const { record, runDir, task } = options;
 	const contract = record.agentContract;
 	const historyPaths = runHistoryPathsFor(options.sessionUuid, path.basename(runDir));
@@ -610,27 +639,32 @@ export async function resumeSubagent(options: ResumeSubagentOptions): Promise<Su
 	updateRunRecord(runDir, {
 		status: "running",
 		childPid: null,
+		// A resume starts a new attempt; the previous outcome is no longer current.
+		result: undefined,
 		updatedAt: new Date().toISOString(),
 		tasks: [...record.tasks, task],
 	});
-	try {
-		const done = await executeChildRun({
-			run,
-			historyPaths,
-			config: contract,
-			fallbackSystemPrompt: contract.systemPrompt,
-			prompt: task,
-			cwd: record.cwd,
-			signal: options.signal,
-			onUpdate: options.onUpdate,
-			onSpawn: (pid) => persistChildPid(runDir, pid),
-		});
-		finalizeRunRecord(runDir, done);
-		return done;
-	} catch (error) {
-		failRunRecord(runDir);
-		throw error;
-	}
+	const done = (async (): Promise<SubagentRunDetails> => {
+		try {
+			const result = await executeChildRun({
+				run,
+				historyPaths,
+				config: contract,
+				fallbackSystemPrompt: contract.systemPrompt,
+				prompt: task,
+				cwd: record.cwd,
+				signal: options.signal,
+				onUpdate: options.onUpdate,
+				onSpawn: (pid) => persistChildPid(runDir, pid),
+			});
+			finalizeRunRecord(runDir, result);
+			return result;
+		} catch (error) {
+			failRunRecord(runDir);
+			throw error;
+		}
+	})();
+	return { runId: path.basename(runDir), dir: runDir, details: run, done };
 }
 
 function progressText(run: SubagentRunDetails): string {

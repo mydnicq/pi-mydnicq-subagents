@@ -7,6 +7,10 @@
  * exact model/thinking/tools/system prompt, `cwd` says where to spawn, `tasks`
  * labels the attempts, and `childPid` tells a live run from a crashed one.
  *
+ * The optional `result` is the settled outcome. Background runs deliver their
+ * result as a message; the stored outcome is the safety net when that message
+ * cannot be delivered.
+ *
  * Status is one of four stored states — `running | complete | failed |
  * stopped`; "interrupted" is a display label for a `running` record whose
  * child pid is gone (see displayStatus), never a stored state.
@@ -34,6 +38,30 @@ export interface RunAgentContract {
 	systemPrompt: string;
 }
 
+/** Settled outcome of one run attempt, persisted for recovery and status display. */
+export interface RunOutcome {
+	exitCode: number;
+	output: string;
+	stderr: string;
+	/** Final assistant stopReason, when known. */
+	stopReason?: string;
+	/** Error message reported by the child, when any. */
+	errorMessage?: string;
+	/** Present when the run was stopped from the run card or via the stop path. */
+	stop?: { by: "user"; reason?: string };
+	usage: {
+		input: number;
+		output: number;
+		cacheRead: number;
+		cacheWrite: number;
+		cost: number;
+		turns: number;
+		contextTokens: number;
+	};
+	/** When the run settled. */
+	finishedAt: string;
+}
+
 /** Persisted state of one subagent run. */
 export interface RunRecord {
 	version: typeof RUN_RECORD_VERSION;
@@ -47,9 +75,33 @@ export interface RunRecord {
 	agentContract: RunAgentContract;
 	/** Original task first; one entry per resume attempt. */
 	tasks: string[];
+	/** Settled outcome; absent while the run has not produced one. */
+	result?: RunOutcome;
 }
 
 const RUN_STATUSES: ReadonlySet<string> = new Set(["running", "complete", "failed", "stopped"]);
+
+const OUTCOME_USAGE_FIELDS = ["input", "output", "cacheRead", "cacheWrite", "cost", "turns", "contextTokens"] as const;
+
+/** Structural validation for the optional stored outcome. */
+function isRunOutcome(value: unknown): value is RunOutcome {
+	if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+	const outcome = value as Record<string, unknown>;
+	if (!Number.isInteger(outcome.exitCode)) return false;
+	if (typeof outcome.output !== "string" || typeof outcome.stderr !== "string") return false;
+	if (typeof outcome.finishedAt !== "string") return false;
+	if (outcome.stopReason !== undefined && typeof outcome.stopReason !== "string") return false;
+	if (outcome.errorMessage !== undefined && typeof outcome.errorMessage !== "string") return false;
+	if (outcome.stop !== undefined) {
+		if (!outcome.stop || typeof outcome.stop !== "object" || Array.isArray(outcome.stop)) return false;
+		const stop = outcome.stop as Record<string, unknown>;
+		if (stop.by !== "user") return false;
+		if (stop.reason !== undefined && typeof stop.reason !== "string") return false;
+	}
+	if (!outcome.usage || typeof outcome.usage !== "object" || Array.isArray(outcome.usage)) return false;
+	const usage = outcome.usage as Record<string, unknown>;
+	return OUTCOME_USAGE_FIELDS.every((field) => typeof usage[field] === "number");
+}
 
 /** Validate a parsed record; returns the record or a human-readable problem. */
 function parseRunRecord(value: unknown): RunRecord | string {
@@ -77,6 +129,7 @@ function parseRunRecord(value: unknown): RunRecord | string {
 		return "tasks is invalid";
 	}
 	if (candidate.tasks.length === 0) return "tasks is empty";
+	if (candidate.result !== undefined && !isRunOutcome(candidate.result)) return "result is invalid";
 	return candidate as unknown as RunRecord;
 }
 

@@ -5,6 +5,8 @@ A [pi](https://pi.dev) extension for delegating tasks to subagents.
 ## Tools
 
 - `subagent` — delegate `{ agent, task }` to a configured agent.
+  Runs are asynchronous: the tool returns a receipt immediately, and the
+  result arrives later as a `[subagent-result]` message that wakes the main agent.
   - `{ action: "resume", run, task }` — continue a finished run (same agent, same context).
   - `{ action: "status" }` — list this session's runs; add `run` to show one.
 
@@ -15,16 +17,20 @@ A [pi](https://pi.dev) extension for delegating tasks to subagents.
 
 ## Features
 
+- **Background runs** — keep working while a subagent runs. The tool returns a
+  receipt at once and its run card keeps updating (spinner, model, turns, context,
+  history link); the completion message brings the result back and wakes the main
+  agent. The main agent ends its turn when it needs the result to continue.
 - **Run history** — inspect what a subagent actually did and which tools it
   used, then fine-tune its configuration: every run is exported to a static
   HTML page you can follow in the browser; the run card links to it.
 - **Resume a run** — give a finished subagent more work with
   `{ action: "resume", run, task }`: the child continues its existing session, so it
-  keeps everything it learned. Each resume is a new attempt on the same run record
-  and the same history page.
-- **Stop a run** — don't wait out a run that is going the wrong way, and don't
-  kill your session: press **alt+s** while it is in flight and the main agent
-  carries on with the partial output.
+  keeps everything it learned. The resume runs in the background like any other
+  run. Each resume is a new attempt on the same run record and the same history page.
+- **Stop a run** — press **alt+s** while a background run is in flight to kill it.
+  The completion message reports the stop and includes any partial output; the
+  session keeps running.
 
 ## Defining agents
 

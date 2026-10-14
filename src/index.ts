@@ -1,6 +1,5 @@
 import type {
 	AgentToolResult,
-	AgentToolUpdateCallback,
 	ExtensionAPI,
 	ExtensionCommandContext,
 	ExtensionContext,
@@ -8,7 +7,7 @@ import type {
 	Theme,
 } from "@earendil-works/pi-coding-agent";
 import { getMarkdownTheme } from "@earendil-works/pi-coding-agent";
-import { Container, Markdown, Text, getCapabilities, hyperlink } from "@earendil-works/pi-tui";
+import { Container, Markdown, Text, getCapabilities, hyperlink, type Component } from "@earendil-works/pi-tui";
 import { pathToFileURL } from "node:url";
 import * as fs from "node:fs";
 import * as path from "node:path";
@@ -16,19 +15,25 @@ import { Type, type Static } from "typebox";
 import { loadProjectAgents, type AgentDefinition, type AgentLoadResult } from "./loader.ts";
 import {
 	CHILD_ENV,
-	DEFAULT_STOP_REASON,
 	formatTokens,
 	formatUsage,
 	isFailedRun,
 	listActiveSubagentRuns,
-	resumeSubagent,
-	runSubagent,
 	serializeForkContext,
 	splitModelRef,
 	subagentModelRef,
 	type StoppableSubagentRun,
 	type SubagentRunDetails,
 } from "./runner.ts";
+import {
+	startBackgroundResume,
+	startBackgroundRun,
+	stopAllBackgroundRuns,
+	type BackgroundResumeOptions,
+	type BackgroundRunOptions,
+	type BackgroundRunReceipt,
+	type StartedBackgroundRun,
+} from "./background-runs.ts";
 import { runHistoryPathsFor } from "./run-history.ts";
 import { runHistoryPageUrl } from "./run-history-server.ts";
 import {
@@ -38,6 +43,7 @@ import {
 	resumability,
 	runIsInFlight,
 	type KnownRun,
+	type RunOutcome,
 	type RunRecord,
 } from "./run-store.ts";
 
@@ -61,8 +67,21 @@ export interface SubagentTextDetails {
 	kind: "text";
 }
 
+/** Details of the receipt returned when a background run starts. */
+export interface SubagentReceiptDetails {
+	kind: "receipt";
+	runId: string;
+	dir: string;
+	agent: string;
+	task: string;
+	/** Configured model reference the child runs with. */
+	model: string;
+	action: "run" | "resume";
+	attempt: number;
+}
+
 /** Union of all `subagent` tool result details. */
-export type SubagentToolDetails = SubagentRunDetails | SubagentTextDetails;
+export type SubagentToolDetails = SubagentRunDetails | SubagentTextDetails | SubagentReceiptDetails;
 
 /** Maximum runs shown by the status listing. */
 const MAX_STATUS_RUNS = 10;
@@ -116,18 +135,23 @@ function buildToolDescription(roster: AgentLoadResult | null): string {
 		"the agent's configured model, thinking level, tools allowlist, and system prompt.";
 	const actions =
 		"Actions:\n" +
-		'- { action: "run", agent, task } (default) — start a new run; the result ends with its run id.\n' +
-		'- { action: "resume", run, task } — append follow-up work to a finished run (complete or failed), keeping its full context. Refused for stopped or in-flight runs.\n' +
+		'- { action: "run", agent, task } (default) — start a run in the background; returns a receipt with its run id.\n' +
+		'- { action: "resume", run, task } — give a finished run (complete or failed) follow-up work in the background, keeping its full context. Refused for stopped or in-flight runs.\n' +
 		'- { action: "status" } — list this session\'s runs; add "run" to show one.';
+	const lifecycle =
+		"Every run is asynchronous: it keeps working after the tool call returns. When it finishes you " +
+		"receive a [subagent-result] message that wakes you and carries the result. Do not poll for " +
+		"progress. If the next step needs the result, end your turn and wait for that message. Use " +
+		"status to check progress, to recover a result whose message you missed, or to find a run id.";
 	const how =
 		"Agents are defined as Markdown files with YAML frontmatter in the project's .pi/agents " +
 		"directory; the frontmatter name field defines the agent name.";
-	if (!roster) return `${base}\n\n${actions}\n\n${how}`;
+	if (!roster) return `${base}\n\n${actions}\n\n${lifecycle}\n\n${how}`;
 	if (roster.agents.size === 0) {
-		return `${base}\n\n${actions}\n\nNo agents are currently configured in .pi/agents — run calls fail until one is defined.\n\n${how}`;
+		return `${base}\n\n${actions}\n\n${lifecycle}\n\nNo agents are currently configured in .pi/agents — run calls fail until one is defined.\n\n${how}`;
 	}
 	const lines = [...roster.agents].map(([name, a]) => `- ${name}: ${a.description}`);
-	return `${base}\n\n${actions}\n\nAvailable agents:\n${lines.join("\n")}\n\n${how}`;
+	return `${base}\n\n${actions}\n\n${lifecycle}\n\nAvailable agents:\n${lines.join("\n")}\n\n${how}`;
 }
 
 function unknownAgentText(name: string, roster: AgentLoadResult): string {
@@ -148,11 +172,6 @@ function rosterText(roster: AgentLoadResult): string {
 function truncate(text: string, max: number): string {
 	if (text.length <= max) return text;
 	return `${text.slice(0, max)}…`;
-}
-
-function failedRunMessage(run: SubagentRunDetails): string {
-	const reason = run.errorMessage?.trim() || run.stderr.trim() || run.output.trim() || "(no output)";
-	return `Subagent "${run.agent}" ${run.stopReason ?? "failed"} (exit ${run.exitCode}): ${truncate(reason, 2000)}`;
 }
 
 /**
@@ -193,15 +212,6 @@ function stopLineText(run: SubagentRunDetails): string {
 	return `Stopped by user${reason}`;
 }
 
-/** Result text the main agent receives when a run is stopped via alt+s. */
-function stoppedRunMessage(run: SubagentRunDetails): string {
-	const partial = run.output?.trim();
-	return (
-		`Subagent "${run.agent}" was stopped by the user. Reason: ${run.stop?.reason ?? DEFAULT_STOP_REASON}.` +
-		(partial ? `\n\nPartial output before the stop:\n${truncate(partial, 1000)}` : "")
-	);
-}
-
 /** Plain-text tool result (status reports and lookup errors); rendered without a run card. */
 function textResult(text: string): AgentToolResult<SubagentToolDetails> {
 	return { content: [{ type: "text", text }], details: { kind: "text" } };
@@ -213,6 +223,267 @@ function runTrailer(run: SubagentRunDetails): string {
 	const state = isFailedRun(run) ? "failed" : "complete";
 	const attempt = (run.attempt ?? 1) > 1 ? `, attempt ${run.attempt}` : "";
 	return `\n\n[run ${run.runId} (${state}${attempt}) — resume with subagent({action:"resume", run:"${run.runId}", task:"…"})]`;
+}
+
+/** Tool result for a launched background run: a receipt the model acts on. */
+function receiptResult(receipt: BackgroundRunReceipt): AgentToolResult<SubagentToolDetails> {
+	const verb = receipt.action === "resume" ? "resumed" : "started";
+	return {
+		content: [
+			{
+				type: "text",
+				text:
+					`Subagent "${receipt.agent}" ${verb} in the background (run ${receipt.runId}).\n` +
+					"It keeps running while you continue. Its result arrives later as a [subagent-result] message that wakes you; if the next step needs the result, end your turn instead of polling.\n" +
+					`Check progress with subagent({action:"status",run:"${receipt.runId}"}) or stop it with alt+s.`,
+			},
+		],
+		details: { kind: "receipt", ...receipt },
+	};
+}
+
+/** Message text delivered when a background run settles. */
+function completionMessageText(run: SubagentRunDetails): string {
+	const id = run.runId ?? "(unknown)";
+	if (run.stop) {
+		const partial = run.output?.trim();
+		return (
+			`Subagent "${run.agent}" (run ${id}) was stopped by the user.` +
+			(partial ? `\n\nPartial output before the stop:\n${truncate(partial, 2000)}` : "")
+		);
+	}
+	if (isFailedRun(run)) {
+		const reason = run.errorMessage?.trim() || run.stderr.trim() || run.output.trim() || "(no output)";
+		return `Subagent "${run.agent}" (run ${id}) failed: ${truncate(reason, 2000)}${runTrailer(run)}`;
+	}
+	return `Subagent "${run.agent}" (run ${id}) finished with:\n\n${run.output || "(no output)"}${runTrailer(run)}`;
+}
+
+/**
+ * Live state for background-run cards, keyed by run id.
+ *
+ * A background run's tool result is returned immediately, so its row is
+ * refreshed by calling the tool renderer's `context.invalidate()` on every
+ * child progress event. The renderer resolves the current state from this map,
+ * which keeps the card correct even when the transcript re-renders.
+ */
+const liveRunCards = new Map<string, { run: SubagentRunDetails; settled: boolean; invalidate?: (() => void) | undefined }>();
+
+/** Animation frames for in-flight run cards; same glyphs pi uses for its own working indicator. */
+const RUN_SPINNER_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+
+/** Repaint interval for in-flight run cards, in milliseconds. */
+const RUN_SPINNER_INTERVAL_MS = 100;
+
+let runSpinnerFrame = 0;
+let runSpinnerTimer: NodeJS.Timeout | undefined;
+
+/**
+ * Keep in-flight run cards animating. The interval runs only while at least
+ * one card is unsettled and stops itself when the last run settles.
+ */
+function ensureRunSpinner(): void {
+	if (runSpinnerTimer) return;
+	runSpinnerTimer = setInterval(() => {
+		const running = [...liveRunCards.values()].filter((card) => !card.settled);
+		if (running.length === 0) {
+			clearInterval(runSpinnerTimer);
+			runSpinnerTimer = undefined;
+			return;
+		}
+		runSpinnerFrame = (runSpinnerFrame + 1) % RUN_SPINNER_FRAMES.length;
+		for (const card of running) card.invalidate?.();
+	}, RUN_SPINNER_INTERVAL_MS);
+	runSpinnerTimer.unref?.();
+}
+
+function stopRunSpinner(): void {
+	if (runSpinnerTimer) clearInterval(runSpinnerTimer);
+	runSpinnerTimer = undefined;
+}
+
+/**
+ * Launch a background run and wire its live card and completion message into the session.
+ *
+ * The completion message uses triggerTurn so an idle parent wakes and acts; a
+ * busy parent receives it at the next turn boundary. Delivery failure is
+ * logged only — the outcome is stored in the run directory either way.
+ */
+function launchBackgroundRun(pi: ExtensionAPI, started: StartedBackgroundRun): AgentToolResult<SubagentToolDetails> {
+	const { receipt, details, done } = started;
+	const card = { run: details, settled: false, invalidate: undefined as (() => void) | undefined };
+	liveRunCards.set(receipt.runId, card);
+	ensureRunSpinner();
+	void done.then(
+		(run) => {
+			card.run = run;
+			card.settled = true;
+			card.invalidate?.();
+			try {
+				pi.sendMessage(
+					{ customType: "subagent-result", content: completionMessageText(run), display: true, details: run },
+					{ triggerTurn: true },
+				);
+			} catch (error) {
+				console.error("Failed to deliver subagent result message:", error);
+			}
+		},
+		(error: unknown) => {
+			const message = error instanceof Error ? error.message : String(error);
+			// Surface the failure on the card too: the receipt is the run's live card.
+			card.settled = true;
+			card.run.stopReason = card.run.stopReason ?? "error";
+			card.run.errorMessage = message;
+			card.invalidate?.();
+			// Runs aborted by session shutdown have no result to report.
+			if (message === "Subagent was aborted") return;
+			try {
+				pi.sendMessage(
+					{
+						customType: "subagent-result",
+						content: `Subagent "${receipt.agent}" (run ${receipt.runId}) could not run: ${truncate(message, 2000)}`,
+						display: true,
+						details: { kind: "receipt", ...receipt },
+					},
+					{ triggerTurn: true },
+				);
+			} catch (deliveryError) {
+				console.error("Failed to deliver subagent failure message:", deliveryError);
+			}
+		},
+	);
+	return receiptResult(receipt);
+}
+
+/** Start a fresh background run with live-card refreshes wired to its progress events. */
+function startLiveBackgroundRun(options: BackgroundRunOptions): StartedBackgroundRun {
+	let started: StartedBackgroundRun | undefined;
+	started = startBackgroundRun({
+		...options,
+		onProgress: () => {
+			if (started) liveRunCards.get(started.receipt.runId)?.invalidate?.();
+		},
+	});
+	return started;
+}
+
+/** Resume a finished run in the background with the same live-card wiring. */
+function startLiveBackgroundResume(options: BackgroundResumeOptions): StartedBackgroundRun {
+	let started: StartedBackgroundRun | undefined;
+	started = startBackgroundResume({
+		...options,
+		onProgress: () => {
+			if (started) liveRunCards.get(started.receipt.runId)?.invalidate?.();
+		},
+	});
+	return started;
+}
+
+/** Receipt card for a background run: live run state, or the static receipt after a reload. */
+function renderReceiptCard(receipt: SubagentReceiptDetails, expanded: boolean, theme: Theme): Component {
+	const card = liveRunCards.get(receipt.runId);
+	if (card) return renderRunCard(card.run, expanded, !card.settled, theme);
+	const verb = receipt.action === "resume" ? "resumed" : "started";
+	const title = `${theme.fg("toolTitle", theme.bold(receipt.agent))} ${theme.fg("muted", `· ${verb} in the background`)}`;
+	const meta = [
+		...(receipt.model ? [theme.fg("muted", receipt.model)] : []),
+		theme.fg("dim", `run ${receipt.runId}`),
+	].join(" · ");
+	return new Text(`${title}\n${meta} — the result arrives as a message`, 0, 0);
+}
+
+/**
+ * Completion message: one status line plus a short output summary.
+ *
+ * The full result stays in the model context; the run card above carries the
+ * expandable output (Ctrl+O). This message deliberately stays short.
+ */
+function renderCompletionMessage(run: SubagentRunDetails, theme: Theme): Component {
+	const failed = isFailedRun(run);
+	const stopped = run.stop !== undefined;
+	const icon = stopped ? theme.fg("warning", "■") : failed ? theme.fg("error", "✗") : theme.fg("success", "✓");
+	const state = stopped ? "stopped" : failed ? "failed" : "finished";
+	const lines = [
+		`${icon} ${theme.fg("toolTitle", theme.bold(run.agent))} ${theme.fg("muted", state)} ${theme.fg("dim", `(run ${run.runId ?? "?"})`)}`,
+	];
+	const output = run.output?.trim() ?? "";
+	const error = failed ? run.errorMessage?.trim() || run.stderr.trim() : "";
+	if (error) {
+		lines.push(theme.fg("error", truncate(error.split("\n")[0] ?? error, 200)));
+	} else if (output) {
+		const outputLines = output.split("\n");
+		const more = outputLines.length > 1
+			? theme.fg("dim", ` (+${outputLines.length - 1} more line${outputLines.length - 1 === 1 ? "" : "s"})`)
+			: "";
+		lines.push(`${theme.fg("toolOutput", truncate(outputLines[0] ?? "", 160))}${more}`);
+	} else {
+		lines.push(theme.fg("muted", stopped ? "stopped by user" : "(no output)"));
+	}
+	return new Text(lines.join("\n"), 0, 0);
+}
+
+/** Run card shared by the tool result and the completion message. */
+function renderRunCard(run: SubagentRunDetails, expanded: boolean, isPartial: boolean, theme: Theme): Component {
+	const stopped = run.stop !== undefined;
+	const failed = isFailedRun(run);
+	const icon = stopped
+		? theme.fg("warning", "■")
+		: failed
+			? theme.fg("error", "✗")
+			: isPartial
+				? theme.fg("accent", RUN_SPINNER_FRAMES[runSpinnerFrame] ?? RUN_SPINNER_FRAMES[0]!)
+				: theme.fg("success", "✓");
+	const usage = formatUsage(run);
+	const ctxUsage = contextUsageText(run);
+	const modelRef = subagentModelRef(run);
+	const historyLink = historyLinkText(run, theme);
+	// Stop affordance: press alt+s while the run is in flight (no browser).
+	const stopHint = isPartial && !failed && !stopped ? theme.fg("dim", ` · ${STOP_KEY_HINT}`) : undefined;
+	const resumed = (run.attempt ?? 1) > 1;
+	const segments = [
+		...(resumed
+			? [theme.fg("muted", "resumed"), theme.fg("dim", `attempt ${run.attempt}`)]
+			: run.context
+				? [theme.fg("muted", run.context)]
+				: []),
+		...(modelRef ? [theme.fg("muted", modelRef)] : []),
+		...(usage ? [theme.fg("dim", usage)] : []),
+		...(ctxUsage ? [theme.fg("dim", ctxUsage)] : []),
+	];
+	let header = `${icon} ${theme.fg("toolTitle", theme.bold(run.agent))} ${segments.join(" · ")}`;
+	if (stopped) header += ` ${theme.fg("warning", "[stopped]")}`;
+	else if (failed && run.stopReason) header += ` ${theme.fg("error", `[${run.stopReason}]`)}`;
+	if (historyLink) header += ` · ${historyLink}`;
+	if (stopHint) header += stopHint;
+
+	const output = run.output?.trim();
+	if (expanded && output) {
+		const container = new Container();
+		container.addChild(new Text(header, 0, 0));
+		if (stopped) container.addChild(new Text(theme.fg("muted", stopLineText(run)), 0, 0));
+		else if (historyLink) container.addChild(new Text(theme.fg("dim", HISTORY_OPEN_HINT), 0, 0));
+		else if (run.history) container.addChild(new Text(theme.fg("dim", historyHintText(run)), 0, 0));
+		if (failed && (run.errorMessage || run.stderr.trim())) {
+			container.addChild(new Text(theme.fg("error", truncate(run.errorMessage ?? run.stderr, 1000)), 0, 0));
+		}
+		container.addChild(new Markdown(output, 0, 0, getMarkdownTheme()));
+		return container;
+	}
+
+	let text = header;
+	if (stopped) {
+		text += `\n${theme.fg("muted", stopLineText(run))}`;
+	} else if (failed && (run.errorMessage || run.stderr.trim())) {
+		text += `\n${theme.fg("error", truncate(run.errorMessage ?? run.stderr, 300))}`;
+	} else if (output) {
+		const lines = output.split("\n").slice(0, 3).map((line) => truncate(line, 200));
+		text += `\n${theme.fg("toolOutput", lines.join("\n"))}`;
+		if (output.split("\n").length > 3) text += `\n${theme.fg("muted", "(Ctrl+O to expand)")}`;
+	} else {
+		text += `\n${theme.fg("muted", isPartial ? "running…" : "(no output)")}`;
+		if (!historyLink && run.history) text += `\n${theme.fg("dim", historyHintText(run))}`;
+	}
+	return new Text(text, 0, 0);
 }
 
 function isDirectory(p: string): boolean {
@@ -261,13 +532,28 @@ function statusListText(runs: KnownRun[]): string {
 	return lines.join("\n").trimEnd();
 }
 
-/** `status <run>`: one run's contract, location, and attempt tasks. */
+/** Human-readable lines for a run's stored outcome. */
+function outcomeLines(outcome: RunOutcome): string[] {
+	const parts = [`exit ${outcome.exitCode}`];
+	if (outcome.stop) parts.push("stopped by user");
+	// "stop" is the normal assistant stopReason; only surface meaningful ones (error, aborted, length, …).
+	else if (outcome.stopReason && outcome.stopReason !== "stop") parts.push(outcome.stopReason);
+	if (outcome.usage.turns > 0) parts.push(`${outcome.usage.turns} turn${outcome.usage.turns === 1 ? "" : "s"}`);
+	if (outcome.usage.output > 0) parts.push(`↓${formatTokens(outcome.usage.output)}`);
+	if (outcome.usage.cost > 0) parts.push(`$${outcome.usage.cost.toFixed(4)}`);
+	const lines = [parts.join(" · ")];
+	const body = outcome.output.trim() || outcome.errorMessage?.trim() || outcome.stderr.trim();
+	if (body) lines.push("", truncate(body, 1500));
+	return lines;
+}
+
+/** `status <run>`: one run's contract, location, attempt tasks, and stored outcome. */
 async function statusDetailText(sessionUuid: string, runId: string, record: RunRecord): Promise<string> {
 	const paths = runHistoryPathsFor(sessionUuid, runId);
 	const history = (await runHistoryPageUrl(paths.urlPath)) ?? paths.htmlFile;
 	const attempts = record.tasks.length;
 	const countLabel = attempts > 1 ? `, ${attempts} attempts` : "";
-	return [
+	const lines = [
 		`Run ${runId} — ${record.agent} (${displayStatus(record)}${countLabel})`,
 		`cwd: ${record.cwd}`,
 		`model: ${record.agentContract.model} · thinking ${record.agentContract.thinking} · tools ${record.agentContract.tools.join(",")}`,
@@ -275,7 +561,9 @@ async function statusDetailText(sessionUuid: string, runId: string, record: RunR
 		"",
 		"tasks:",
 		...record.tasks.map((task, index) => `  ${index + 1}. ${taskSummary(task)}`),
-	].join("\n");
+	];
+	if (record.result) lines.push("", "result:", ...outcomeLines(record.result));
+	return lines.join("\n");
 }
 
 /** Unknown run id: list the session's runs so the caller can pick one. */
@@ -303,13 +591,12 @@ function invalidRecordRunText(runId: string, message: string): string {
 	return `Run "${runId}" has an unreadable run record (${message}). Start a new run instead.`;
 }
 
-/** "run" action: resolve the agent, spawn a fresh child, return its final output. */
-async function executeRun(
+/** "run" action: resolve the agent, launch a background run, return its receipt. */
+function executeRun(
+	pi: ExtensionAPI,
 	params: SubagentToolInput,
-	signal: AbortSignal | undefined,
-	onUpdate: AgentToolUpdateCallback<SubagentRunDetails> | undefined,
 	ctx: ExtensionContext,
-): Promise<AgentToolResult<SubagentToolDetails>> {
+): AgentToolResult<SubagentToolDetails> {
 	const agentName = params.agent?.trim() ?? "";
 	const task = params.task?.trim() ?? "";
 	const roster = loadProjectAgents(ctx.cwd);
@@ -326,36 +613,19 @@ async function executeRun(
 	const forkTranscript =
 		agent.context === "fork" ? serializeForkContext(ctx.sessionManager.buildContextEntries()) || undefined : undefined;
 
-	const run = await runSubagent({
+	return launchBackgroundRun(pi, startLiveBackgroundRun({
 		agent,
 		task,
 		cwd: ctx.cwd,
 		sessionUuid: ctx.sessionManager.getSessionId(),
 		forkTranscript,
-		signal,
-		onUpdate,
-	});
-	// Stopped via alt+s: a deliberate user action, so the main agent gets a
-	// normal result carrying the encoded reason instead of a thrown error.
-	if (run.stop) {
-		return {
-			content: [{ type: "text", text: stoppedRunMessage(run) }],
-			details: run,
-		};
-	}
-	if (isFailedRun(run)) throw new Error(failedRunMessage(run) + runTrailer(run));
-
-	return {
-		content: [{ type: "text", text: (run.output || "(no output)") + runTrailer(run) }],
-		details: run,
-	};
+	}));
 }
 
-/** "resume" action: continue a finished run with a follow-up task. */
+/** "resume" action: continue a finished run in the background, return its receipt. */
 async function executeResume(
+	pi: ExtensionAPI,
 	params: SubagentToolInput,
-	signal: AbortSignal | undefined,
-	onUpdate: AgentToolUpdateCallback<SubagentRunDetails> | undefined,
 	ctx: ExtensionContext,
 ): Promise<AgentToolResult<SubagentToolDetails>> {
 	const reference = params.run?.trim() ?? "";
@@ -390,19 +660,12 @@ async function executeResume(
 	}
 
 	rememberModelRegistry(ctx);
-	const run = await resumeSubagent({ record, runDir: dir, sessionUuid, task, signal, onUpdate });
-	if (run.stop) {
-		return {
-			content: [{ type: "text", text: stoppedRunMessage(run) }],
-			details: run,
-		};
-	}
-	if (isFailedRun(run)) throw new Error(failedRunMessage(run) + runTrailer(run));
-
-	return {
-		content: [{ type: "text", text: (run.output || "(no output)") + runTrailer(run) }],
-		details: run,
-	};
+	return launchBackgroundRun(pi, startLiveBackgroundResume({
+		record,
+		runDir: dir,
+		sessionUuid,
+		task,
+	}));
 }
 
 /** "status" action: list this session's runs, or show one run in detail. */
@@ -425,9 +688,8 @@ async function executeStatus(
 
 /** Tool execution: dispatch on the requested action after the trust gate. */
 async function executeDelegation(
+	pi: ExtensionAPI,
 	params: SubagentToolInput,
-	signal: AbortSignal | undefined,
-	onUpdate: AgentToolUpdateCallback<SubagentRunDetails> | undefined,
 	ctx: ExtensionContext,
 ): Promise<AgentToolResult<SubagentToolDetails>> {
 	const action = params.action ?? "run";
@@ -440,14 +702,14 @@ async function executeDelegation(
 	if (action === "resume") {
 		if (!params.run?.trim()) return textResult('subagent({action:"resume"}) requires the run id in "run".');
 		if (!params.task?.trim()) return textResult('subagent({action:"resume"}) requires the follow-up task in "task".');
-		return executeResume(params, signal, onUpdate, ctx);
+		return executeResume(pi, params, ctx);
 	}
 	if (!params.agent?.trim()) return textResult('subagent({action:"run"}) requires the agent name in "agent".');
 	if (!params.task?.trim()) return textResult('subagent({action:"run"}) requires the task in "task".');
-	return executeRun(params, signal, onUpdate, ctx);
+	return executeRun(pi, params, ctx);
 }
 
-/** Run a delegation from /subagent and inject the result into the session. */
+/** Run a delegation from /subagent in the background; the result arrives as a message. */
 async function runCommandDelegation(
 	pi: ExtensionAPI,
 	agent: AgentDefinition,
@@ -458,36 +720,18 @@ async function runCommandDelegation(
 		agent.context === "fork" ? serializeForkContext(ctx.sessionManager.buildContextEntries()) || undefined : undefined;
 
 	rememberModelRegistry(ctx);
-	ctx.ui.setStatus("subagent", `${agent.name}: running${forkTranscript ? " (fork)" : ""}`);
-	try {
-		const run = await runSubagent({ agent, task, cwd: ctx.cwd, sessionUuid: ctx.sessionManager.getSessionId(), forkTranscript });
-		ctx.ui.setStatus("subagent", undefined);
-		if (run.stop) {
-			ctx.ui.notify(`Subagent "${run.agent}" stopped from its run card${run.stop.reason ? ` — ${run.stop.reason}` : ""}.`, "warning");
-			return;
-		}
-		if (isFailedRun(run)) {
-			ctx.ui.notify(failedRunMessage(run), "error");
-			return;
-		}
-		const usage = formatUsage(run);
-		ctx.ui.notify(`Subagent "${run.agent}" completed${usage ? ` · ${usage}` : ""}`, "info");
-		// Deliver the result into the conversation; the main agent reacts on its next turn.
-		await pi.sendMessage(
-			{
-				customType: "subagent-result",
-				content: `Subagent "${run.agent}" (${run.context}, ${subagentModelRef(run)}) finished with:\n\n${run.output || "(no output)"}`,
-				display: true,
-				details: run,
-			},
-			{ deliverAs: "followUp", triggerTurn: true },
-		);
-	} catch (err) {
-		ctx.ui.setStatus("subagent", undefined);
-		const message = err instanceof Error ? err.message : String(err);
-		if (message === "Subagent was aborted") ctx.ui.notify("Subagent aborted.", "warning");
-		else ctx.ui.notify(`Subagent "${agent.name}" failed: ${truncate(message, 500)}`, "error");
-	}
+	const started = startLiveBackgroundRun({
+		agent,
+		task,
+		cwd: ctx.cwd,
+		sessionUuid: ctx.sessionManager.getSessionId(),
+		forkTranscript,
+	});
+	launchBackgroundRun(pi, started);
+	ctx.ui.notify(
+		`Subagent "${agent.name}" started in the background (run ${started.receipt.runId}). Its result arrives in the chat.`,
+		"info",
+	);
 }
 
 function registerSubagentTool(pi: ExtensionAPI, roster: AgentLoadResult | null): void {
@@ -498,12 +742,13 @@ function registerSubagentTool(pi: ExtensionAPI, roster: AgentLoadResult | null):
 		promptSnippet: "Delegate a task to a named subagent configured in .pi/agents, resume a finished run, or list this session's runs.",
 		promptGuidelines: [
 			"Use subagent when a task matches one of the configured subagent descriptions; pass the full, self-contained task text as task.",
+			"Runs are asynchronous: after starting one, keep working or end your turn, but never poll for progress. The [subagent-result] message arrives on its own and wakes you; if the next step needs that result, wait for the message instead of guessing.",
 			'To give a finished subagent follow-up work that builds on what it already did, resume it with action "resume" and its run id instead of starting a new run.',
-			'Use action "status" when you need the run ids of subagents started earlier in this session.',
+			'Use action "status" when you need the run ids of subagents started earlier in this session, to check progress, or to recover a result whose message you missed.',
 		],
 		parameters: subagentSchema,
-		execute(_toolCallId, params, signal, onUpdate, ctx) {
-			return executeDelegation(params, signal, onUpdate, ctx);
+		execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+			return executeDelegation(pi, params, ctx);
 		},
 		renderCall(args, theme) {
 			const action = args.action ?? "run";
@@ -518,82 +763,37 @@ function registerSubagentTool(pi: ExtensionAPI, roster: AgentLoadResult | null):
 					: `${theme.fg("toolTitle", theme.bold("subagent "))}${theme.fg("accent", args.agent ?? "")}`;
 			return new Text(`${head}\n  ${theme.fg("dim", preview)}`, 0, 0);
 		},
-		renderResult(result, { expanded, isPartial }, theme) {
+			renderResult(result, { expanded, isPartial }, theme, context) {
 			const details = result.details;
+			if ("kind" in details && details.kind === "receipt") {
+				// Refresh this row from the live run state on every child progress event.
+				const card = liveRunCards.get(details.runId);
+				if (card) card.invalidate = context.invalidate;
+				return renderReceiptCard(details, expanded, theme);
+			}
 			if ("kind" in details) {
 				const first = result.content[0];
 				return new Text(first?.type === "text" ? first.text : "(no output)", 0, 0);
 			}
-			const run = details;
-
-			const stopped = run.stop !== undefined;
-			const failed = isFailedRun(run);
-			const icon = stopped
-				? theme.fg("warning", "■")
-				: failed
-					? theme.fg("error", "✗")
-					: theme.fg("success", "✓");
-			const usage = formatUsage(run);
-			const ctxUsage = contextUsageText(run);
-			const modelRef = subagentModelRef(run);
-			const historyLink = historyLinkText(run, theme);
-			// Stop affordance: press alt+s while the run is in flight (no browser).
-			const stopHint = isPartial && !failed && !stopped ? theme.fg("dim", ` · ${STOP_KEY_HINT}`) : undefined;
-			const resumed = (run.attempt ?? 1) > 1;
-			const segments = [
-				...(resumed
-					? [theme.fg("muted", "resumed"), theme.fg("dim", `attempt ${run.attempt}`)]
-					: run.context
-						? [theme.fg("muted", run.context)]
-						: []),
-				...(modelRef ? [theme.fg("muted", modelRef)] : []),
-				...(usage ? [theme.fg("dim", usage)] : []),
-				...(ctxUsage ? [theme.fg("dim", ctxUsage)] : []),
-			];
-			let header = `${icon} ${theme.fg("toolTitle", theme.bold(run.agent))} ${segments.join(" · ")}`;
-			if (stopped) header += ` ${theme.fg("warning", "[stopped]")}`;
-			else if (failed && run.stopReason) header += ` ${theme.fg("error", `[${run.stopReason}]`)}`;
-			if (historyLink) header += ` · ${historyLink}`;
-			if (stopHint) header += stopHint;
-
-			const output = run.output?.trim();
-			if (expanded && output) {
-				const container = new Container();
-				container.addChild(new Text(header, 0, 0));
-				if (stopped) container.addChild(new Text(theme.fg("muted", stopLineText(run)), 0, 0));
-				else if (historyLink) container.addChild(new Text(theme.fg("dim", HISTORY_OPEN_HINT), 0, 0));
-				else if (run.history) container.addChild(new Text(theme.fg("dim", historyHintText(run)), 0, 0));
-				if (failed && run.errorMessage) {
-					container.addChild(new Text(theme.fg("error", truncate(run.errorMessage, 1000)), 0, 0));
-				}
-				container.addChild(new Markdown(output, 0, 0, getMarkdownTheme()));
-				return container;
-			}
-
-			let text = header;
-			if (stopped) {
-				text += `\n${theme.fg("muted", stopLineText(run))}`;
-			} else if (failed && run.errorMessage) {
-				text += `\n${theme.fg("error", truncate(run.errorMessage, 300))}`;
-			} else if (output) {
-				const lines = output.split("\n").slice(0, 3).map((line) => truncate(line, 200));
-				text += `\n${theme.fg("toolOutput", lines.join("\n"))}`;
-				if (output.split("\n").length > 3) text += `\n${theme.fg("muted", "(Ctrl+O to expand)")}`;
-			} else {
-				text += `\n${theme.fg("muted", isPartial ? "running…" : "(no output)")}`;
-				if (!historyLink && run.history) text += `\n${theme.fg("dim", historyHintText(run))}`;
-			}
-			return new Text(text, 0, 0);
+			return renderRunCard(details, expanded, isPartial, theme);
 		},
 	});
 }
 
 export default function (pi: ExtensionAPI) {
-	// Children spawned by runSubagent carry CHILD_ENV and must not be able to
+	// Children spawned by startSubagent carry CHILD_ENV and must not be able to
 	// delegate further — skip all registration in child processes.
 	if (process.env[CHILD_ENV] === "1") return;
 
 	registerSubagentTool(pi, null);
+
+	// Completion messages stay short: the full result lives in the model context
+	// and the expandable output (Ctrl+O) lives on the run card above.
+	pi.registerMessageRenderer<SubagentRunDetails | SubagentReceiptDetails>("subagent-result", (message, _options, theme) => {
+		const details = message.details;
+		if (!details || "kind" in details) return undefined;
+		return renderCompletionMessage(details, theme);
+	});
 
 	// alt+s — stop an in-flight subagent run. One run: instant stop with the
 	// encoded default reason. Several runs: a picker of the active ones.
@@ -617,6 +817,14 @@ export default function (pi: ExtensionAPI) {
 			target.stop();
 			ctx.ui.notify(`Stopping ${target.agent} — the main agent receives the reason.`, "info");
 		},
+	});
+
+	// Background children belong to this process: kill them when the session
+	// shuts down (quit, reload, or session replacement).
+	pi.on("session_shutdown", () => {
+		stopAllBackgroundRuns();
+		stopRunSpinner();
+		liveRunCards.clear();
 	});
 
 	pi.on("session_start", async (_event, ctx) => {
