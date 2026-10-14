@@ -18,12 +18,15 @@ A [pi](https://pi.dev) extension for delegating tasks to subagents.
 ## Features
 
 - **Background runs** — keep working while a subagent runs. The tool returns a
-  receipt at once and its run card keeps updating (spinner, model, turns, context,
-  history link); the completion message brings the result back and wakes the main
+  receipt at once and its one-line run card keeps updating in a stack below the
+  input area (spinner, agent, model, usage, history link; resumed runs marked).
+  Cards pop as runs finish; the completion message brings the result back as
+  the run's final card (Ctrl+O to expand, history link) and wakes the main
   agent. The main agent ends its turn when it needs the result to continue.
 - **Run history** — inspect what a subagent actually did and which tools it
   used, then fine-tune its configuration: every run is exported to a static
-  HTML page you can follow in the browser; the run card links to it.
+  HTML page you can follow in the browser; the run card and completion message
+  link to it.
 - **Resume a run** — give a finished subagent more work with
   `{ action: "resume", run, task }`: the child continues its existing session, so it
   keeps everything it learned. The resume runs in the background like any other

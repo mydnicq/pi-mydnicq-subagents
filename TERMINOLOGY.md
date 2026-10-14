@@ -10,20 +10,25 @@ outcome arrives later as a completion message.
 ## Completion message
 
 The `[subagent-result]` message that wakes the main agent when a background run
-settles or fails to start. Carries the full outcome; the transcript shows a
-short summary.
+settles or fails to start. Carries the full outcome; the transcript renders it
+as the run's final card (output preview, Ctrl+O to expand, history link).
 
 ## Run receipt
 
 The tool result returned when a background run starts: the run id, the agent,
-and the configured model. The same card keeps updating as the run works, so it
-becomes the run's live card and final result.
+and the configured model. The run then appears as a **subagent run card** in the
+**run stack**.
 
 ## Subagent run card
 
-Inline card in the main chat showing a subagent run's state and live progress
-(spinner, agent, context, model, turns, usage, history link) plus its output
-preview (Ctrl+O to expand). Not the footer **status line**.
+One-line live card in the **run stack** (spinner, agent, run id, model, resume
+state, usage, history link). Not the footer **status line**.
+
+## Run stack
+
+The stacked **subagent run cards** shown below the editor (input area), at most
+8 visible with a `+N more runs` line. A card pops the moment its run settles;
+the stack unmounts when empty.
 
 ## Subagent system prompt
 
