@@ -13,6 +13,7 @@
  */
 
 import {
+	resumeStoppedChild,
 	startResume,
 	startSubagent,
 	type ResumeSubagentOptions,
@@ -39,6 +40,8 @@ export interface StartedBackgroundRun {
 	/** Mutable live run state, shared with the UI card until the run settles. */
 	details: SubagentRunDetails;
 	done: Promise<SubagentRunDetails>;
+	/** True when a stopped live child accepted the task; its outcome is already wired. */
+	live?: boolean;
 }
 
 /** Fresh background-run launch options, plus a progress hook for the live card. */
@@ -89,21 +92,31 @@ export function startBackgroundRun(options: BackgroundRunOptions): StartedBackgr
 }
 
 /** Resume a finished run in the background; returns as soon as the record is marked running. */
-export function startBackgroundResume(options: BackgroundResumeOptions): StartedBackgroundRun {
+export async function startBackgroundResume(options: BackgroundResumeOptions): Promise<StartedBackgroundRun> {
 	const { onProgress, ...launch } = options;
+	const base = {
+		agent: options.record.agent,
+		task: options.task,
+		model: options.record.agentContract.model,
+		action: "resume" as const,
+		attempt: options.record.tasks.length + 1,
+	};
+	// A stopped live child keeps its context warm: wake it instead of a new process.
+	const live = await resumeStoppedChild({ runDir: launch.runDir, record: launch.record, task: launch.task });
+	if (live) {
+		onProgress?.();
+		return {
+			receipt: { ...base, runId: live.runId, dir: live.dir },
+			details: live.details,
+			done: live.done,
+			live: true,
+		};
+	}
 	const controller = new AbortController();
 	const started = startResume({ ...launch, signal: controller.signal, onUpdate: () => onProgress?.() });
 	track(started.runId, controller, started.done);
 	return {
-		receipt: {
-			runId: started.runId,
-			dir: started.dir,
-			agent: options.record.agent,
-			task: options.task,
-			model: options.record.agentContract.model,
-			action: "resume",
-			attempt: options.record.tasks.length + 1,
-		},
+		receipt: { ...base, runId: started.runId, dir: started.dir },
 		details: started.details,
 		done: started.done,
 	};

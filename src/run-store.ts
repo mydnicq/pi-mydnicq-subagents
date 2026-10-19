@@ -47,8 +47,8 @@ export interface RunOutcome {
 	stopReason?: string;
 	/** Error message reported by the child, when any. */
 	errorMessage?: string;
-	/** Present when the run was stopped from the run card or via the stop path. */
-	stop?: { by: "user"; reason?: string };
+	/** Present when the main agent stopped the run. */
+	stop?: { by: "user" | "agent"; reason?: string };
 	usage: {
 		input: number;
 		output: number;
@@ -95,7 +95,7 @@ function isRunOutcome(value: unknown): value is RunOutcome {
 	if (outcome.stop !== undefined) {
 		if (!outcome.stop || typeof outcome.stop !== "object" || Array.isArray(outcome.stop)) return false;
 		const stop = outcome.stop as Record<string, unknown>;
-		if (stop.by !== "user") return false;
+		if (stop.by !== "user" && stop.by !== "agent") return false;
 		if (stop.reason !== undefined && typeof stop.reason !== "string") return false;
 	}
 	if (!outcome.usage || typeof outcome.usage !== "object" || Array.isArray(outcome.usage)) return false;
@@ -281,7 +281,6 @@ export function displayStatus(record: RunRecord): RunDisplayStatus {
 export type RunResumability = { resumable: true } | { resumable: false; reason: string };
 
 export function resumability(record: RunRecord, dir: string): RunResumability {
-	if (record.status === "stopped") return { resumable: false, reason: "stopped by user" };
 	if (runIsInFlight(record)) return { resumable: false, reason: "in flight" };
 	if (!fs.existsSync(path.join(dir, "session.jsonl"))) return { resumable: false, reason: "session file missing" };
 	if (!isDirectory(record.cwd)) return { resumable: false, reason: "working directory missing" };

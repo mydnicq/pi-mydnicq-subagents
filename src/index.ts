@@ -15,14 +15,16 @@ import { Type, type Static } from "typebox";
 import { loadProjectAgents, type AgentDefinition, type AgentLoadResult } from "./loader.ts";
 import {
 	CHILD_ENV,
+	closeAllLiveChildren,
 	formatTokens,
 	formatUsage,
 	isFailedRun,
 	listActiveSubagentRuns,
+	listStoppedLiveChildren,
 	serializeForkContext,
 	splitModelRef,
 	subagentModelRef,
-	type StoppableSubagentRun,
+	type SubagentRunControl,
 	type SubagentRunDetails,
 } from "./runner.ts";
 import {
@@ -49,9 +51,20 @@ import {
 
 const subagentSchema = Type.Object({
 	action: Type.Optional(
-		Type.Union([Type.Literal("run"), Type.Literal("resume"), Type.Literal("status")], {
-			description: '"run" (default) starts a new subagent run; "resume" continues a finished run; "status" lists this session\'s runs.',
-		}),
+		Type.Union(
+			[
+				Type.Literal("run"),
+				Type.Literal("resume"),
+				Type.Literal("status"),
+				Type.Literal("steer"),
+				Type.Literal("interrupt"),
+				Type.Literal("stop"),
+			],
+			{
+				description:
+					'"run" (default) starts a new subagent run; "resume" continues a stopped or finished run; "steer" adds guidance to a running run; "interrupt" cancels the current work and sends a new task; "stop" cancels the current work and keeps the run stopped; "status" lists this session\'s runs.',
+			},
+		),
 	),
 	agent: Type.Optional(Type.String({ description: 'Agent to run; required for action "run".' })),
 	run: Type.Optional(
@@ -117,13 +130,16 @@ function contextUsageText(run: SubagentRunDetails): string {
 
 function buildToolDescription(roster: AgentLoadResult | null): string {
 	const base =
-		"Delegate work to a named subagent, continue a finished subagent run, or inspect this " +
+		"Delegate work to a named subagent, continue a run, control a live run, or inspect this " +
 		"session's runs. Each run is an isolated pi child process (its own context window) with " +
 		"the agent's configured model, thinking level, tools allowlist, and system prompt.";
 	const actions =
 		"Actions:\n" +
 		'- { action: "run", agent, task } (default) — start a run in the background; returns a receipt with its run id.\n' +
-		'- { action: "resume", run, task } — give a finished run (complete or failed) follow-up work in the background, keeping its full context. Refused for stopped or in-flight runs.\n' +
+		'- { action: "resume", run, task } — give a stopped or finished run follow-up work; a stopped child continues in place when it is still alive.\n' +
+		'- { action: "steer", run, task } — add guidance to a running run; the child receives it at its next tool boundary.\n' +
+		'- { action: "interrupt", run, task } — cancel the current work and send a new task to the same child.\n' +
+		'- { action: "stop", run } — cancel the current work and keep the child idle for a resume.\n' +
 		'- { action: "status" } — list this session\'s runs; add "run" to show one.';
 	const lifecycle =
 		"Every run is asynchronous: it keeps working after the tool call returns. When it finishes you " +
@@ -184,16 +200,11 @@ function historyHintText(run: SubagentRunDetails): string {
 /** Gesture hint for opening the ↗ history link (herdr opens pane links on ctrl/cmd-click). */
 const HISTORY_OPEN_HINT = "(ctrl/cmd-click to open · refresh the page to see the latest export)";
 
-/** Plain-words line describing a user stop, for the completion card. */
+/** Plain-words line describing a stop, for the completion card. */
 function stopLineText(run: SubagentRunDetails): string {
+	const by = run.stop?.by === "agent" ? "the main agent" : "the user";
 	const reason = run.stop?.reason ? ` — reason: ${truncate(run.stop.reason, 200)}` : "";
-	return `Stopped by user${reason}`;
-}
-
-/** Picker label for an active run: agent, task preview, short run id. */
-function stopOptionLabel(run: StoppableSubagentRun): string {
-	const shortId = path.basename(run.id).slice(-4);
-	return `${run.agent} — ${truncate(run.task.replace(/\s+/g, " "), 60)} (${shortId})`;
+	return `Stopped by ${by}${reason}`;
 }
 
 /** Plain-text tool result (status reports and lookup errors); rendered without a run card. */
@@ -201,10 +212,10 @@ function textResult(text: string): AgentToolResult<SubagentToolDetails> {
 	return { content: [{ type: "text", text }], details: { kind: "text" } };
 }
 
-/** Compact run trailer the main agent uses to resume a finished run. */
+/** Compact run trailer the main agent uses to resume a finished or stopped run. */
 function runTrailer(run: SubagentRunDetails): string {
-	if (!run.runId || run.stop) return "";
-	const state = isFailedRun(run) ? "failed" : "complete";
+	if (!run.runId) return "";
+	const state = run.stop ? "stopped" : isFailedRun(run) ? "failed" : "complete";
 	const attempt = (run.attempt ?? 1) > 1 ? `, attempt ${run.attempt}` : "";
 	return `\n\n[run ${run.runId} (${state}${attempt}) — resume with subagent({action:"resume", run:"${run.runId}", task:"…"})]`;
 }
@@ -219,7 +230,7 @@ function receiptResult(receipt: BackgroundRunReceipt): AgentToolResult<SubagentT
 				text:
 					`Subagent "${receipt.agent}" ${verb} in the background (run ${receipt.runId}).\n` +
 					"It keeps running while you continue. Its result arrives later as a [subagent-result] message that wakes you; if the next step needs the result, end your turn instead of polling.\n" +
-					`Check progress with subagent({action:"status",run:"${receipt.runId}"}) or stop it with alt+s.`,
+					`Check progress with subagent({action:"status",run:"${receipt.runId}"}). To correct a live run, use steer, interrupt, or stop.`,
 			},
 		],
 		details: { kind: "receipt", ...receipt },
@@ -232,7 +243,7 @@ function completionMessageText(run: SubagentRunDetails): string {
 	if (run.stop) {
 		const partial = run.output?.trim();
 		return (
-			`Subagent "${run.agent}" (run ${id}) was stopped by the user.` +
+			`Subagent "${run.agent}" (run ${id}) was stopped by ${run.stop.by === "agent" ? "the main agent" : "the user"}.` +
 			(partial ? `\n\nPartial output before the stop:\n${truncate(partial, 2000)}` : "")
 		);
 	}
@@ -398,6 +409,8 @@ function launchBackgroundRun(pi: ExtensionAPI, started: StartedBackgroundRun): A
 	liveRunStack.set(receipt.runId, details);
 	ensureRunSpinner();
 	refreshRunStackWidget();
+	// A live resume already has a completion handler from its original launch.
+	if (started.live) return receiptResult(receipt);
 	const popCard = (): void => {
 		liveRunStack.delete(receipt.runId);
 		refreshRunStackWidget();
@@ -405,6 +418,8 @@ function launchBackgroundRun(pi: ExtensionAPI, started: StartedBackgroundRun): A
 	void done.then(
 		(run) => {
 			popCard();
+			// A stopped run sends no completion message; the stop tool result is final.
+			if (run.stop) return;
 			try {
 				pi.sendMessage(
 					{ customType: "subagent-result", content: completionMessageText(run), display: true, details: run },
@@ -419,6 +434,8 @@ function launchBackgroundRun(pi: ExtensionAPI, started: StartedBackgroundRun): A
 			popCard();
 			// Runs aborted by session shutdown have no result to report.
 			if (message === "Subagent was aborted") return;
+			// A stopped run sends no completion message.
+			if (details.stop) return;
 			try {
 				pi.sendMessage(
 					{
@@ -449,10 +466,10 @@ function startLiveBackgroundRun(options: BackgroundRunOptions): StartedBackgroun
 	return started;
 }
 
-/** Resume a finished run in the background with the same live-card wiring. */
-function startLiveBackgroundResume(options: BackgroundResumeOptions): StartedBackgroundRun {
+/** Resume a finished or stopped run in the background with the same live-card wiring. */
+async function startLiveBackgroundResume(options: BackgroundResumeOptions): Promise<StartedBackgroundRun> {
 	let started: StartedBackgroundRun | undefined;
-	started = startBackgroundResume({
+	started = await startBackgroundResume({
 		...options,
 		onProgress: () => {
 			if (started) refreshRunStackWidget();
@@ -653,7 +670,107 @@ function executeRun(
 	}));
 }
 
-/** "resume" action: continue a finished run in the background, return its receipt. */
+type ControlLookup =
+	| { kind: "ok"; control: SubagentRunControl }
+	| { kind: "stopped"; id: string }
+	| { kind: "ambiguous"; matches: string[] }
+	| { kind: "unknown"; active: SubagentRunControl[] };
+
+/** Resolve a run reference against the live children in this process. */
+function resolveControl(reference: string): ControlLookup {
+	const active = listActiveSubagentRuns();
+	const matches = active.filter((control) => {
+		const id = path.basename(control.id);
+		return id === reference || id.startsWith(reference);
+	});
+	if (matches.length === 1) return { kind: "ok", control: matches[0]! };
+	if (matches.length > 1) return { kind: "ambiguous", matches: matches.map((control) => path.basename(control.id)) };
+	const stopped = listStoppedLiveChildren().filter((child) => {
+		const id = path.basename(child.id);
+		return id === reference || id.startsWith(reference);
+	});
+	if (stopped.length === 1) return { kind: "stopped", id: path.basename(stopped[0]!.id) };
+	if (stopped.length > 1) return { kind: "ambiguous", matches: stopped.map((child) => path.basename(child.id)) };
+	return { kind: "unknown", active };
+}
+
+/** Plain-words line for a control lookup that found no single target. */
+function controlLookupText(reference: string, lookup: ControlLookup): string {
+	if (lookup.kind === "ambiguous") {
+		return [`Run id "${reference}" matches several runs:`, ...lookup.matches.map((match) => `- ${match}`), "Pass the full id."].join("\n");
+	}
+	if (lookup.kind === "stopped") {
+		return `Run ${lookup.id} is stopped. Use subagent({action:"resume", run:"${lookup.id}", task:"…"}) to send new instructions.`;
+	}
+	if (lookup.kind === "unknown" && lookup.active.length === 0) {
+		return `No live subagent run matches "${reference}". Use subagent({action:"status"}) to list this session's runs.`;
+	}
+	const lines = [`No running subagent run matches "${reference}". Runs at work:`];
+	if (lookup.kind === "unknown") {
+		for (const control of lookup.active) {
+			lines.push(`- ${path.basename(control.id)} (${control.agent}) — ${truncate(control.task.replace(/\s+/g, " "), 80)}`);
+		}
+	}
+	return lines.join("\n");
+}
+
+function controlErrorText(error: unknown): string {
+	return `Run control failed: ${error instanceof Error ? error.message : String(error)}`;
+}
+
+/** "steer" action: add guidance to a running child. */
+async function executeSteer(params: SubagentToolInput): Promise<AgentToolResult<SubagentToolDetails>> {
+	const reference = params.run?.trim() ?? "";
+	const message = params.task?.trim() ?? "";
+	const lookup = resolveControl(reference);
+	if (lookup.kind !== "ok") return textResult(controlLookupText(reference, lookup));
+	try {
+		await lookup.control.steer(message);
+	} catch (error) {
+		return textResult(controlErrorText(error));
+	}
+	const runId = path.basename(lookup.control.id);
+	return textResult(
+		`Guidance sent to run ${runId}. The child receives it at its next tool boundary. Use interrupt to cancel the current work first.`,
+	);
+}
+
+/** "interrupt" action: cancel the current work and send a new task to the same child. */
+async function executeInterrupt(params: SubagentToolInput): Promise<AgentToolResult<SubagentToolDetails>> {
+	const reference = params.run?.trim() ?? "";
+	const message = params.task?.trim() ?? "";
+	const lookup = resolveControl(reference);
+	if (lookup.kind !== "ok") return textResult(controlLookupText(reference, lookup));
+	try {
+		await lookup.control.interrupt(message);
+	} catch (error) {
+		return textResult(controlErrorText(error));
+	}
+	const runId = path.basename(lookup.control.id);
+	return textResult(
+		`Run ${runId} was interrupted. The child received the new task and keeps its full context.`,
+	);
+}
+
+/** "stop" action: cancel the current work and keep the child idle for a resume. */
+async function executeStop(params: SubagentToolInput): Promise<AgentToolResult<SubagentToolDetails>> {
+	const reference = params.run?.trim() ?? "";
+	const lookup = resolveControl(reference);
+	if (lookup.kind !== "ok") return textResult(controlLookupText(reference, lookup));
+	try {
+		await lookup.control.stop();
+	} catch (error) {
+		return textResult(controlErrorText(error));
+	}
+	const runId = path.basename(lookup.control.id);
+	liveRunStack.delete(runId);
+	refreshRunStackWidget();
+	return textResult(
+		`Run ${runId} stopped. The child stays idle for 10 minutes. Resume it with subagent({action:"resume", run:"${runId}", task:"…"}).`,
+	);
+}
+
+/** "resume" action: continue a stopped or finished run in the background, return its receipt. */
 async function executeResume(
 	pi: ExtensionAPI,
 	params: SubagentToolInput,
@@ -672,13 +789,10 @@ async function executeResume(
 	if (params.agent && params.agent !== record.agent) {
 		return textResult(`Run ${runId} belongs to agent "${record.agent}", not "${params.agent}".`);
 	}
-	if (record.status === "stopped") {
-		return textResult(`Run ${runId} was stopped and cannot be resumed. Start a new run instead.`);
-	}
 	const inProcess = listActiveSubagentRuns().some((active) => active.id === dir);
 	if (inProcess || runIsInFlight(record)) {
 		return textResult(
-			`Run ${runId} is still in flight (started ${timeAgo(record.updatedAt)}). Wait for it to finish, or stop it (alt+s), then resume.`,
+			`Run ${runId} is still at work (started ${timeAgo(record.updatedAt)}). Use steer, interrupt, or stop before resume.`,
 		);
 	}
 	if (!fs.existsSync(path.join(dir, "session.jsonl"))) {
@@ -691,7 +805,7 @@ async function executeResume(
 	}
 
 	rememberModelRegistry(ctx);
-	return launchBackgroundRun(pi, startLiveBackgroundResume({
+	return launchBackgroundRun(pi, await startLiveBackgroundResume({
 		record,
 		runDir: dir,
 		sessionUuid,
@@ -727,10 +841,25 @@ async function executeDelegation(
 	const action = params.action ?? "run";
 	if (!ctx.isProjectTrusted()) {
 		const what =
-			action === "run" ? "read .pi/agents" : action === "resume" ? "resume subagent runs" : "list subagent runs";
+			action === "run"
+				? "read .pi/agents"
+				: action === "resume"
+					? "resume subagent runs"
+					: action === "status"
+						? "list subagent runs"
+						: "control subagent runs";
 		return textResult(`Project is not trusted — refusing to ${what}.`);
 	}
 	if (action === "status") return executeStatus(params, ctx);
+	if (action === "steer" || action === "interrupt") {
+		if (!params.run?.trim()) return textResult(`subagent({action:"${action}"}) requires the run id in "run".`);
+		if (!params.task?.trim()) return textResult(`subagent({action:"${action}"}) requires the message in "task".`);
+		return action === "steer" ? executeSteer(params) : executeInterrupt(params);
+	}
+	if (action === "stop") {
+		if (!params.run?.trim()) return textResult('subagent({action:"stop"}) requires the run id in "run".');
+		return executeStop(params);
+	}
 	if (action === "resume") {
 		if (!params.run?.trim()) return textResult('subagent({action:"resume"}) requires the run id in "run".');
 		if (!params.task?.trim()) return textResult('subagent({action:"resume"}) requires the follow-up task in "task".');
@@ -772,11 +901,13 @@ function registerSubagentTool(pi: ExtensionAPI, roster: AgentLoadResult | null):
 		name: "subagent",
 		label: "Subagent",
 		description: buildToolDescription(roster),
-		promptSnippet: "Delegate a task to a named subagent configured in .pi/agents, resume a finished run, or list this session's runs.",
+		promptSnippet: "Delegate a task to a named subagent configured in .pi/agents, control a live run, resume a run, or list this session's runs.",
 		promptGuidelines: [
 			"Use subagent when a task matches one of the configured subagent descriptions; pass the full, self-contained task text as task.",
 			"Runs are asynchronous: after starting one, keep working or end your turn, but never poll for progress. The [subagent-result] message arrives on its own and wakes you; if the next step needs that result, wait for the message instead of guessing.",
-			'To give a finished subagent follow-up work that builds on what it already did, resume it with action "resume" and its run id instead of starting a new run.',
+			'To correct a live run, use action "steer" for guidance at the next tool boundary, or action "interrupt" to cancel the current work and send a new task in the same context.',
+			'Use action "stop" to cancel the current work and keep the child idle for a resume. A stopped run is resumable.',
+			'To give a stopped or finished subagent follow-up work that builds on what it already did, resume it with action "resume" and its run id instead of starting a new run.',
 			'Use action "status" when you need the run ids of subagents started earlier in this session, to check progress, or to recover a result whose message you missed.',
 		],
 		parameters: subagentSchema,
@@ -818,34 +949,11 @@ export default function (pi: ExtensionAPI) {
 		return renderCompletionCard(details, options.expanded, theme);
 	});
 
-	// alt+s — stop an in-flight subagent run. One run: instant stop with the
-	// encoded default reason. Several runs: a picker of the active ones.
-	pi.registerShortcut("alt+s", {
-		description: "Stop a running subagent",
-		handler: async (ctx) => {
-			const active = listActiveSubagentRuns();
-			if (active.length === 0) {
-				ctx.ui.notify("No subagent run in flight.", "warning");
-				return;
-			}
-			let target = active[0]!;
-			if (active.length > 1) {
-				const options = active.map((run) => stopOptionLabel(run));
-				const choice = await ctx.ui.select("Stop which subagent?", options, { timeout: 30_000 });
-				if (choice === undefined) return; // cancelled or timed out
-				const index = options.indexOf(choice);
-				if (index === -1) return;
-				target = active[index]!;
-			}
-			target.stop();
-			ctx.ui.notify(`Stopping ${target.agent} — the main agent receives the reason.`, "info");
-		},
-	});
-
 	// Background children belong to this process: kill them when the session
 	// shuts down (quit, reload, or session replacement).
 	pi.on("session_shutdown", () => {
 		stopAllBackgroundRuns();
+		closeAllLiveChildren();
 		stopRunSpinner();
 		liveRunStack.clear();
 		lastUiContext = undefined;

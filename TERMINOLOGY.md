@@ -1,37 +1,56 @@
 # Terminology
 
-Project ubiquitous language. Define terms here; use them consistently.
+This file defines the project terms. Use these terms in the code, the docs, and
+the UI.
 
 ## Background run
 
-A subagent run that continues after the `subagent` tool call returns. Its
+A subagent run that continues after the `subagent` tool call returns. The
 outcome arrives later as a completion message.
 
 ## Completion message
 
 The `[subagent-result]` message that wakes the main agent when a background run
-settles or fails to start. Carries the full outcome; the transcript renders it
-as the run's final card (output preview, Ctrl+O to expand, history link).
+settles or fails to start. The message has the full outcome. The transcript
+shows it as the final card for the run (output preview, Ctrl+O to expand,
+history link).
 
 ## Run receipt
 
-The tool result returned when a background run starts: the run id, the agent,
-and the configured model. The run then appears as a **subagent run card** in the
-**run stack**.
+The tool result that the `subagent` tool returns when a background run starts.
+It has the run id, the agent, and the configured model. The run then appears as
+a **subagent run card** in the **run stack**.
 
 ## Subagent run card
 
-One-line live card in the **run stack** (spinner, agent, run id, model, resume
-state, usage, history link). Not the footer **status line**.
+A one-line live card in the **run stack**. It shows the spinner, agent, run id,
+model, resume state, usage, and history link. It is not the footer **status
+line**.
 
 ## Run stack
 
-The stacked **subagent run cards** shown below the editor (input area), at most
-8 visible with a `+N more runs` line. A card pops the moment its run settles;
-the stack unmounts when empty.
+The stack of **subagent run cards** below the editor (input area). It shows at
+most 8 cards and a `+N more runs` line. A card pops when its run settles. The
+stack unmounts when it is empty.
 
 ## Subagent system prompt
 
-The Markdown body of an agent file — everything after the YAML frontmatter.
-Passed to the subagent as its system prompt; frontmatter fields configure the
-run, the body instructs the agent.
+The Markdown body of an agent file: everything after the YAML frontmatter. The
+extension passes it to the subagent as the system prompt. The frontmatter fields
+configure the run. The body instructs the agent.
+
+## Steer
+
+Guidance for a live subagent. The child receives it at its next tool boundary.
+A steer never cancels the current work.
+
+## Interrupt
+
+A control action. It cancels the current work of the subagent and sends a new
+task to the same child. The child keeps its context.
+
+## Stop
+
+A control action. It cancels the current work of the subagent and keeps the
+child idle for a resume. The stop tool result is final. A later resume sends
+the completion message.
