@@ -54,3 +54,13 @@ task to the same child. The child keeps its context.
 A control action. It cancels the current work of the subagent and keeps the
 child idle for a resume. The stop tool result is final. A later resume sends
 the completion message.
+
+## Agent directory
+
+The folder `.pi/agents/<folder>/` for one agent. It holds the **agent file**
+and the agent's own space, for example `scripts/`.
+
+## Agent file
+
+The `AGENT.md` file in an **agent directory**. It has the YAML frontmatter
+(configuration) and the Markdown body (**subagent system prompt**).
