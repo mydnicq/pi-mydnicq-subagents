@@ -50,14 +50,18 @@ Actions:
 
 ## Agent files
 
-Each agent is a Markdown file. The file has YAML frontmatter and a body. Put
-the file in the `.pi/agents` directory. The `name` field defines the agent name.
-The body is the subagent system prompt.
+Each agent has its own directory in `.pi/agents`. The directory holds the
+agent file `AGENT.md`. The agent file has YAML frontmatter and a body. The
+`name` field defines the agent name. The body is the subagent system prompt.
+The directory name is for organization only. The agent directory is also the
+agent's own space; for example, it can hold a `scripts/` directory.
+
+Flat `.pi/agents/<name>.md` files are not loaded.
 
 Example:
 
 ```markdown
-<!-- .pi/agents/reviewer.md -->
+<!-- .pi/agents/reviewer/AGENT.md -->
 ---
 name: reviewer
 description: Reviews code changes for correctness and style

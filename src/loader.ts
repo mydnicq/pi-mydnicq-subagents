@@ -1,8 +1,8 @@
 /**
  * Loader for project subagent definitions.
  *
- * Agents are defined as Markdown files with YAML frontmatter in
- * `<project>/.pi/agents/*.md`:
+ * Agents are defined by an agent directory with an agent file:
+ * `<project>/.pi/agents/<agent-directory>/AGENT.md`:
  *
  *   ---
  *   name: reviewer
@@ -16,7 +16,8 @@
  *   System prompt goes here.
  *
  * The frontmatter `name` defines the agent name; the Markdown body is the
- * agent's system prompt. The file name is organizational only.
+ * agent's system prompt. The directory name is organizational only. Flat
+ * `.pi/agents/*.md` files are not loaded.
  */
 
 import * as fs from "node:fs";
@@ -26,6 +27,9 @@ import { CONFIG_DIR_NAME, getAgentDir, loadProjectContextFiles } from "@earendil
 
 /** Subdirectory of the project config dir that holds agent files. */
 export const AGENTS_DIR_NAME = "agents";
+
+/** Exact file name of the agent file inside an agent directory. */
+export const AGENT_FILE_NAME = "AGENT.md";
 
 export const THINKING_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh", "max"] as const;
 export type AgentThinkingLevel = (typeof THINKING_LEVELS)[number];
@@ -63,7 +67,7 @@ export interface AgentLoadDiagnostic {
 }
 
 export interface AgentLoadResult {
-	/** Agent definitions keyed by agent name (the file name without extension). */
+	/** Agent definitions keyed by agent name (the frontmatter `name`). */
 	agents: Map<string, AgentDefinition>;
 	/** Non-fatal problems (unknown fields, empty prompt). */
 	warnings: AgentLoadDiagnostic[];
@@ -74,7 +78,7 @@ export interface AgentLoadResult {
 }
 
 const FRONTMATTER_RE = /^---\r?\n([\s\S]*?)\r?\n---(?:\r?\n|$)/;
-/** Agent names come from file names; keep them tool-parameter safe. */
+/** Agent names come from the frontmatter; keep them tool-parameter safe. */
 const NAME_RE = /^[a-z0-9][a-z0-9_-]*$/;
 
 /**
@@ -149,7 +153,7 @@ export function parseAgentDefinition(file: string, raw: string): {
 		return { agent: null, warnings, errors };
 	};
 
-	// `name` is required: it defines the agent name (the file name is organizational only).
+	// `name` is required: it defines the agent name (the directory name is organizational only).
 	const nameRaw = record.name;
 	if (typeof nameRaw !== "string" || nameRaw.trim() === "") {
 		return fail('Missing required frontmatter field "name".');
@@ -258,9 +262,36 @@ export function getAgentsDir(projectDir: string): string {
 }
 
 /**
- * Load all agent definitions from `<project>/.pi/agents/*.md`, keyed by the
- * frontmatter `name`. Never throws; per-file problems are collected in
- * warnings/errors.
+ * Locate the agent file in an agent directory. The loader requires the exact
+ * name `AGENT.md`; a file that differs only by case is reported separately so
+ * the failure is visible on case-insensitive file systems too.
+ */
+function findAgentFile(dir: string): { file: string | null; caseVariant: string | null; unreadable: string | null } {
+	let entries: fs.Dirent[];
+	try {
+		entries = fs.readdirSync(dir, { withFileTypes: true });
+	} catch (err) {
+		return { file: null, caseVariant: null, unreadable: err instanceof Error ? err.message : String(err) };
+	}
+	for (const entry of entries) {
+		if (entry.isFile() && entry.name === AGENT_FILE_NAME) {
+			return { file: path.join(dir, entry.name), caseVariant: null, unreadable: null };
+		}
+	}
+	const lowerName = AGENT_FILE_NAME.toLowerCase();
+	for (const entry of entries) {
+		if (entry.isFile() && entry.name.toLowerCase() === lowerName) {
+			return { file: null, caseVariant: path.join(dir, entry.name), unreadable: null };
+		}
+	}
+	return { file: null, caseVariant: null, unreadable: null };
+}
+
+/**
+ * Load all agent definitions from `<project>/.pi/agents/<agent-directory>/AGENT.md`,
+ * keyed by the frontmatter `name`. Never throws; per-file problems are
+ * collected in warnings/errors. Flat files and symlinked directories are
+ * ignored.
  */
 export function loadProjectAgents(cwd: string): AgentLoadResult {
 	const agentsDir = getAgentsDir(findProjectConfigDir(cwd));
@@ -275,8 +306,28 @@ export function loadProjectAgents(cwd: string): AgentLoadResult {
 
 	const nameSources = new Map<string, string>(); // agent name → file that declared it first
 	for (const entry of entries.sort((a, b) => a.name.localeCompare(b.name))) {
-		if (!entry.isFile() || !entry.name.endsWith(".md")) continue;
-		const file = path.join(agentsDir, entry.name);
+		if (!entry.isDirectory()) continue; // flat files, symlinks, and other entries are ignored
+		const dir = path.join(agentsDir, entry.name);
+		const found = findAgentFile(dir);
+		if (found.unreadable) {
+			result.errors.push({ file: dir, message: `Unreadable: ${found.unreadable}` });
+			continue;
+		}
+		if (found.caseVariant) {
+			result.errors.push({
+				file: found.caseVariant,
+				message: `Found "${path.basename(found.caseVariant)}". The loader requires the exact name "${AGENT_FILE_NAME}".`,
+			});
+			continue;
+		}
+		if (!found.file) {
+			result.warnings.push({
+				file: dir,
+				message: `Missing "${AGENT_FILE_NAME}" in this directory. No agent loaded.`,
+			});
+			continue;
+		}
+		const file = found.file;
 		let raw: string;
 		try {
 			raw = fs.readFileSync(file, "utf8");

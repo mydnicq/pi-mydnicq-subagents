@@ -147,8 +147,8 @@ function buildToolDescription(roster: AgentLoadResult | null): string {
 		"progress. If the next step needs the result, end your turn and wait for that message. Use " +
 		"status to check progress, to recover a result whose message you missed, or to find a run id.";
 	const how =
-		"Agents are defined as Markdown files with YAML frontmatter in the project's .pi/agents " +
-		"directory; the frontmatter name field defines the agent name.";
+		"Agents are defined by an agent file at .pi/agents/<agent-directory>/AGENT.md in the project; " +
+		"the file has YAML frontmatter and a Markdown body. The frontmatter name field defines the agent name.";
 	if (!roster) return `${base}\n\n${actions}\n\n${lifecycle}\n\n${how}`;
 	if (roster.agents.size === 0) {
 		return `${base}\n\n${actions}\n\n${lifecycle}\n\nNo agents are currently configured in .pi/agents — run calls fail until one is defined.\n\n${how}`;
@@ -162,7 +162,7 @@ function unknownAgentText(name: string, roster: AgentLoadResult): string {
 	const problems = [...roster.errors, ...roster.warnings].map((d) => `- ${d.file}: ${d.message}`).join("\n");
 	return (
 		`Unknown subagent "${name}". Available: ${available}.\n` +
-		`Define agents in ${roster.agentsDir}/<name>.md` +
+		`Define agents in ${roster.agentsDir}/<agent-directory>/AGENT.md` +
 		(problems ? `\n\nLoad problems:\n${problems}` : "")
 	);
 }

@@ -21,7 +21,7 @@ Goal: a pi session in a split pane that loads THIS repo's extension without inst
 ## B. Fresh setup
 
 1. Preconditions: `HERDR_ENV=1`, cwd = repo root. Stop if not inside herdr.
-2. Ensure test fixtures exist: `.pi/agents/<name>.md` (frontmatter: name, description, model, thinking, context — all required). `ping.md` is the canonical smoke-test agent.
+2. Ensure test fixtures exist: `.pi/agents/<name>/AGENT.md` (frontmatter: name, description, model, thinking, context — all required). `ping/AGENT.md` is the canonical smoke-test agent.
 3. Find your own pane (`herdr pane list` → `focused: true`), then split right:
    ```bash
    NEW_PANE=$(herdr pane split <my-pane> --direction right --no-focus | jq -er '.result.pane.pane_id')
